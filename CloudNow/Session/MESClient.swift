@@ -1,0 +1,195 @@
+import Foundation
+
+// MARK: - MES (Membership Entitlement Service) Client
+
+/// Fetches subscription tier and entitled resolutions/FPS from NVIDIA's MES API.
+/// Requires a VPC ID obtained from the streaming server's /v2/serverInfo endpoint.
+actor MESClient {
+    static let shared = MESClient()
+    private let transport: any HTTPTransport
+
+    init(transport: any HTTPTransport = URLSessionHTTPTransport()) {
+        self.transport = transport
+    }
+
+    // MARK: VPC ID Discovery
+
+    /// Fetches the VPC/server region ID from the streaming base URL.
+    /// Returns nil on failure — caller should fall back to an empty vpcId.
+    func fetchVpcId(token: String, base: String) async throws -> String? {
+        let normalizedBase = base.hasSuffix("/") ? String(base.dropLast()) : base
+        guard let url = URL(string: "\(normalizedBase)/v2/serverInfo") else {
+            throw MESError.invalidURL
+        }
+        var request = URLRequest(url: url)
+        request.setValue("GFNJWT \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(NVIDIAAuth.webOrigin, forHTTPHeaderField: "Origin")
+        request.setValue(NVIDIAAuth.webReferer, forHTTPHeaderField: "Referer")
+        request.setValue(NVIDIAAuth.gfnClientId, forHTTPHeaderField: "nv-client-id")
+        request.setValue("BROWSER", forHTTPHeaderField: "nv-client-type")
+        request.setValue(NVIDIAAuth.gfnClientVersion, forHTTPHeaderField: "nv-client-version")
+        request.setValue("WEBRTC", forHTTPHeaderField: "nv-client-streamer")
+        request.setValue("WINDOWS", forHTTPHeaderField: "nv-device-os")
+        request.setValue("DESKTOP", forHTTPHeaderField: "nv-device-type")
+        request.setValue("UNKNOWN", forHTTPHeaderField: "nv-device-make")
+        request.setValue("UNKNOWN", forHTTPHeaderField: "nv-device-model")
+        request.setValue("CHROME", forHTTPHeaderField: "nv-browser-type")
+        request.setValue(NVIDIAAuth.userAgent, forHTTPHeaderField: "User-Agent")
+        let (data, response) = try await transport.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw MESError.fetchFailed(
+                "serverInfo HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1): \(redactedHTTPBody(data))"
+            )
+        }
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let status = root["requestStatus"] as? [String: Any],
+              let serverId = status["serverId"] as? String
+        else { return nil }
+        return serverId
+    }
+
+    // MARK: Subscription Fetch
+
+    func fetchSubscription(token: String, vpcId: String, userId: String) async throws -> SubscriptionInfo {
+        // Fall back to a known EU VPC if dynamic discovery failed — an empty vpcId returns degraded entitlements
+        let effectiveVpcId = vpcId.isEmpty ? "NP-AMS-08" : vpcId
+        var comps = URLComponents(string: "https://mes.geforcenow.com/v4/subscriptions")!
+        comps.queryItems = [
+            URLQueryItem(name: "serviceName", value: "gfn_pc"),
+            URLQueryItem(name: "languageCode", value: L10n.nvidiaLocaleCode()),
+            URLQueryItem(name: "vpcId", value: effectiveVpcId),
+            URLQueryItem(name: "userId", value: userId),
+        ]
+        guard let url = comps.url else {
+            throw MESError.invalidURL
+        }
+        var request = URLRequest(url: url)
+        request.setValue("GFNJWT \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue(NVIDIAAuth.gfnClientId, forHTTPHeaderField: "nv-client-id")
+        request.setValue("NATIVE", forHTTPHeaderField: "nv-client-type")
+        request.setValue(NVIDIAAuth.gfnClientVersion, forHTTPHeaderField: "nv-client-version")
+        request.setValue("NVIDIA-CLASSIC", forHTTPHeaderField: "nv-client-streamer")
+        request.setValue("WINDOWS", forHTTPHeaderField: "nv-device-os")
+        request.setValue("DESKTOP", forHTTPHeaderField: "nv-device-type")
+        request.setValue(NVIDIAAuth.userAgent, forHTTPHeaderField: "User-Agent")
+        let (data, resp) = try await transport.data(for: request)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            throw MESError.fetchFailed(
+                "HTTP \((resp as? HTTPURLResponse)?.statusCode ?? -1): \(redactedHTTPBody(data))"
+            )
+        }
+        return try parseMESResponse(data)
+    }
+
+    // MARK: Private Parsing
+
+    private func parseMESResponse(_ data: Data) throws -> SubscriptionInfo {
+        let decoder = JSONDecoder()
+
+        // Response may be an array or a single object — try both
+        let raw: MESRawResponse = if let array = try? decoder.decode([MESRawResponse].self, from: data), let first = array.first {
+            first
+        } else {
+            try decoder.decode(MESRawResponse.self, from: data)
+        }
+
+        let tier = raw.membershipTier ?? raw.type ?? "FREE"
+        let isUnlimited = raw.subType?.uppercased() == "UNLIMITED"
+
+        let resolutions: [EntitledResolution] = (raw.features?.resolutions ?? [])
+            .filter { $0.isEntitled != false }
+            .map {
+                EntitledResolution(
+                    widthInPixels: $0.widthInPixels,
+                    heightInPixels: $0.heightInPixels,
+                    framesPerSecond: $0.framesPerSecond
+                )
+            }
+
+        let storage = raw.addons?.first { $0.type == "STORAGE" }?.cloudStorage
+        let installToPlayAccess: Bool? = if let storage {
+            storage.kind == .unknown ? nil : true
+        } else {
+            raw.addons == nil ? nil : false
+        }
+
+        return SubscriptionInfo(
+            membershipTier: tier.uppercased() == "FREE" ? "Free" : tier,
+            isUnlimited: isUnlimited,
+            remainingMinutes: raw.remainingTimeInMinutes,
+            totalMinutes: raw.totalTimeInMinutes,
+            entitledResolutions: resolutions,
+            cloudStorage: storage,
+            installToPlayAccess: installToPlayAccess
+        )
+    }
+}
+
+// MARK: - Codable Response Types
+
+private nonisolated struct MESRawResponse: Decodable {
+    let membershipTier: String?
+    let type: String?
+    let subType: String?
+    let remainingTimeInMinutes: Int?
+    let totalTimeInMinutes: Int?
+    let features: Features?
+    let addons: [Addon]?
+
+    struct Addon: Decodable {
+        let type: String?
+        let subType: String?
+        let status: String?
+        let attributes: [Attribute]?
+
+        var cloudStorage: GFNCloudStorage {
+            GFNCloudStorage(
+                kind: subType.flatMap(GFNCloudStorage.Kind.init(rawValue:)) ?? .unknown,
+                status: status,
+                totalGB: nonnegativeInteger(for: "TOTAL_STORAGE_SIZE_IN_GB"),
+                usedGB: nonnegativeInteger(for: "USED_STORAGE_SIZE_IN_GB"),
+                regionCode: value(for: "STORAGE_METRO_REGION"),
+                regionName: value(for: "STORAGE_METRO_REGION_NAME")
+            )
+        }
+
+        private func value(for key: String) -> String? {
+            attributes?.first { $0.key == key }?.textValue
+        }
+
+        private func nonnegativeInteger(for key: String) -> Int? {
+            guard let value = value(for: key), let number = Int(value), number >= 0 else { return nil }
+            return number
+        }
+
+        struct Attribute: Decodable {
+            let key: String?
+            let textValue: String?
+        }
+    }
+
+    struct Features: Decodable {
+        let resolutions: [Resolution]?
+        struct Resolution: Decodable {
+            let widthInPixels: Int
+            let heightInPixels: Int
+            let framesPerSecond: Int
+            let isEntitled: Bool?
+        }
+    }
+}
+
+// MARK: - Errors
+
+nonisolated enum MESError: Error, LocalizedError {
+    case invalidURL
+    case fetchFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidURL: "Failed to build MES request URL."
+        case let .fetchFailed(msg): "Subscription fetch failed: \(msg)"
+        }
+    }
+}

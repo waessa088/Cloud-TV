@@ -1,0 +1,106 @@
+import Foundation
+
+nonisolated protocol GamesCatalogClient: Sendable {
+    func fetchMainGames(
+        token: String,
+        streamingBaseUrl: String,
+        vpcId: String?
+    ) async throws -> [GameInfo]
+
+    func fetchLibrary(
+        token: String,
+        streamingBaseUrl: String,
+        vpcId: String?
+    ) async throws -> [GameInfo]
+
+    func fetchAvailability(
+        token: String,
+        appId: String,
+        streamingBaseUrl: String,
+        vpcId: String?
+    ) async throws -> [String: GFNGameAvailability]
+
+    func fetchLaunchGame(
+        token: String,
+        appId: String,
+        streamingBaseUrl: String,
+        vpcId: String?
+    ) async throws -> GameInfo?
+
+    func setGameOwnership(token: String, variantId: String, owned: Bool) async throws -> String
+}
+
+extension GamesCatalogClient {
+    func fetchLaunchGame(
+        token _: String,
+        appId _: String,
+        streamingBaseUrl _: String,
+        vpcId _: String?
+    ) async throws -> GameInfo? {
+        nil
+    }
+
+    func setGameOwnership(token _: String, variantId _: String, owned _: Bool) async throws -> String {
+        throw GamesError.fetchFailed("Library changes are unavailable")
+    }
+}
+
+extension GamesClient: GamesCatalogClient {}
+
+nonisolated protocol MembershipClient: Sendable {
+    func fetchVpcId(token: String, base: String) async throws -> String?
+    func fetchSubscription(
+        token: String,
+        vpcId: String,
+        userId: String
+    ) async throws -> SubscriptionInfo
+}
+
+extension MESClient: MembershipClient {}
+
+nonisolated protocol ActiveSessionsClient: Sendable {
+    func getActiveSessions(
+        token: String,
+        base: String
+    ) async throws -> [ActiveSessionInfo]
+}
+
+extension CloudMatchClient: ActiveSessionsClient {}
+
+nonisolated protocol GamesPersistence: Actor {
+    func loadGamesSnapshot(accountScope: String?) -> AppPersistenceStore.GamesSnapshot
+    func saveFavoriteIds(_ ids: Set<String>)
+    func savePreferredStoreIds(_ stores: [String: String])
+    func saveRecentlyPlayedIds(_ ids: [String])
+    func saveStreamSettings(_ settings: StreamSettings)
+    func saveLastSession(_ session: LastSessionRecord?)
+    func saveLibraryGames(
+        _ games: [GameInfo],
+        accountScope: String?,
+        expectedGeneration: UInt64
+    )
+    func saveSubscription(_ subscription: SubscriptionInfo, accountScope: String?)
+    func saveVpcId(_ vpcId: String, accountScope: String?)
+    func loadCatalog(
+        localeCode: String,
+        vpcId: String?,
+        accountScope: String?
+    ) -> [GameInfo]?
+    func saveCatalog(
+        _ games: [GameInfo],
+        localeCode: String,
+        vpcId: String?,
+        accountScope: String?,
+        expectedGeneration: UInt64
+    )
+    func saveRefreshedLibrarySnapshot(
+        libraryGames: [GameInfo],
+        catalogGames: [GameInfo]?,
+        localeCode: String,
+        vpcId: String?,
+        accountScope: String,
+        expectedGeneration: UInt64
+    ) throws
+}
+
+extension AppPersistenceStore: GamesPersistence {}

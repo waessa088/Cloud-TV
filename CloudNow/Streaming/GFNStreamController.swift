@@ -1,0 +1,2606 @@
+// NOTE: This file requires the WebRTC package to be added to the Xcode project via SPM:
+//   https://github.com/livekit/webrtc-xcframework
+//   Product: WebRTC
+//
+
+import AVFoundation
+import Foundation
+@preconcurrency import LiveKitWebRTC
+import Observation
+import os
+
+private nonisolated let gfnLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "GFNStream")
+private nonisolated let videoColorLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "VideoColor")
+private nonisolated let audioSyncLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "AudioSync")
+
+// MARK: - Stream State
+
+enum StreamState: Equatable {
+    case idle
+    case connecting
+    case streaming
+    case reconnecting(attempt: Int)
+    case disconnected(reason: String)
+    case failed(message: String)
+    case sessionEnded
+}
+
+enum StreamOverlayState: Equatable {
+    case none
+    case pauseMenu
+    case textEntry
+}
+
+nonisolated enum ControllerTextEntrySubmissionResult: Equatable, Sendable {
+    case accepted
+    case unsupportedCharacters
+    case unsupportedKeyboardLayout
+    case tooLong
+    case sendFailed
+}
+
+nonisolated struct ControllerTextEntryReplayToken: Equatable, Sendable {
+    fileprivate let generation: UInt64
+}
+
+nonisolated struct ControllerTextEntryReplayLifecycle: Sendable {
+    private(set) var controllerTextEntryActive = false
+    private(set) var replayInputPaused = false
+    private(set) var pendingReplay: ControllerTextEntryReplayToken?
+    private var nextGeneration: UInt64 = 0
+
+    func inputPaused(overlayPaused: Bool) -> Bool {
+        overlayPaused || controllerTextEntryActive || replayInputPaused
+    }
+
+    mutating func beginTextEntry() {
+        controllerTextEntryActive = true
+        replayInputPaused = false
+    }
+
+    mutating func prepareReplay() -> ControllerTextEntryReplayToken? {
+        guard pendingReplay == nil else { return nil }
+        nextGeneration &+= 1
+        let token = ControllerTextEntryReplayToken(generation: nextGeneration)
+        pendingReplay = token
+        return token
+    }
+
+    @discardableResult
+    mutating func acceptReplay(_ token: ControllerTextEntryReplayToken) -> Bool {
+        guard pendingReplay == token else { return false }
+        controllerTextEntryActive = false
+        replayInputPaused = true
+        return true
+    }
+
+    @discardableResult
+    mutating func rejectReplay(_ token: ControllerTextEntryReplayToken) -> Bool {
+        guard pendingReplay == token else { return false }
+        pendingReplay = nil
+        replayInputPaused = false
+        return true
+    }
+
+    @discardableResult
+    mutating func finishReplay(_ token: ControllerTextEntryReplayToken) -> Bool {
+        guard pendingReplay == token else { return false }
+        pendingReplay = nil
+        controllerTextEntryActive = false
+        replayInputPaused = false
+        return true
+    }
+
+    @discardableResult
+    mutating func invalidate() -> ControllerTextEntryReplayToken? {
+        let invalidatedReplay = pendingReplay
+        pendingReplay = nil
+        controllerTextEntryActive = false
+        replayInputPaused = false
+        return invalidatedReplay
+    }
+}
+
+private struct PendingControllerTextEntryReplay {
+    let token: ControllerTextEntryReplayToken
+    let completion: @MainActor @Sendable (ControllerTextEntrySubmissionResult) -> Void
+}
+
+// MARK: - Stream Statistics
+
+nonisolated struct StreamStats: Equatable {
+    var bitrateKbps: Int = 0
+    var resolutionWidth: Int = 0
+    var resolutionHeight: Int = 0
+    var fps: Double = 0
+    var rttMs: Double = 0
+    var packetLossPercent: Double = 0
+    var jitterMs: Double = 0
+    var codec: String = ""
+    var gpuType: String = ""
+    var jitterBufferDelayMs: Double = 0
+    var jitterBufferTargetDelayMs: Double = 0
+    var jitterBufferMinimumDelayMs: Double = 0
+    var decodeTimeMs: Double = 0
+    var processingDelayMs: Double = 0
+    var framesDropped: Int = 0
+    var freezeCount: Int = 0
+    var freezeDurationMs: Double = 0
+    var nackCount: Int = 0
+    var pliCount: Int = 0
+    var firCount: Int = 0
+    var retransmittedPackets: Int = 0
+    var decoderImplementation: String = ""
+    var powerEfficientDecoder: Bool?
+    var selectedCandidatePairId: String = ""
+    var selectedProtocol: String = ""
+    var localCandidateType: String = ""
+    var remoteCandidateType: String = ""
+    var localCandidateAddress: String = ""
+    var remoteCandidateAddress: String = ""
+    var availableIncomingBitrateKbps: Int = 0
+    var candidatePairChanges: Int = 0
+    var selectedNetworkPath: String = "unknown"
+    /// Short GFN zone label the session runs in (e.g. "FRK-08"), derived from the
+    /// CloudMatch routing zone URL to match the official client's display.
+    var serverZone: String = ""
+    var inputGenerated: UInt64 = 0
+    var inputSubmitted: UInt64 = 0
+    var inputAccepted: UInt64 = 0
+    var inputDropped: UInt64 = 0
+    var inputSuperseded: UInt64 = 0
+    var inputBufferedBytes: UInt64 = 0
+    var inputQueueP50Ms: Double = 0
+    var inputQueueP95Ms: Double = 0
+    var inputQueueMaxMs: Double = 0
+    var newestGamepadAgeMs: Double = 0
+    var inputChannelState: String = "closed"
+    /// Average FPS the game renders on the cloud rig, from the server's stats_channel
+    /// messages (0 until the first message arrives). The official client shows this
+    /// alongside the stream FPS.
+    var gameFps: Double = 0
+}
+
+/// Audio metrics surfaced in the statistics HUD, refreshed once per stats tick.
+/// NetEQ values are interval averages derived from AudioSyncStatsSnapshot pairs;
+/// device/route fields are sampled from the live audio session.
+nonisolated struct AudioStats: Equatable {
+    var jitterBufferCurrentMs: Double = 0
+    var jitterBufferTargetMs: Double = 0
+    var devicePlayoutMs: Double = 0
+    var packetsLost: Int = 0
+    var jitterMs: Double = 0
+    var concealedMsPerSecond: Double = 0
+    var stretchedMsPerSecond: Double = 0
+    var acceleratedMsPerSecond: Double = 0
+    /// video − audio playout timestamp; positive = audio lags video. nil without RTCP SR.
+    var avOffsetMs: Double?
+    var inputLatencyMs: Double?
+    var outputLatencyMs: Double = 0
+    var outputChannels: Int = 0
+    var outputSampleRateHz: Double = 0
+    var outputRouteName: String = ""
+    var codecName: String = ""
+    var codecChannels: Int = 0
+}
+
+private nonisolated struct VideoStatsSnapshot {
+    var timestampUs: Double = 0
+    var bytesReceived: Double = 0
+    var packetsReceived: Double = 0
+    var packetsLost: Double = 0
+    var framesDecoded: Double = 0
+    var framesDropped: Double = 0
+    var framesPerSecond: Double = 0
+    var frameWidth: Double = 0
+    var frameHeight: Double = 0
+    var jitterSeconds: Double = 0
+    var jitterBufferDelaySeconds: Double = 0
+    var jitterBufferTargetDelaySeconds: Double = 0
+    var jitterBufferMinimumDelaySeconds: Double = 0
+    var jitterBufferEmittedCount: Double = 0
+    var totalDecodeTimeSeconds: Double = 0
+    var totalProcessingDelaySeconds: Double = 0
+    var freezeCount: Double = 0
+    var totalFreezeDurationSeconds: Double = 0
+    var nackCount: Double = 0
+    var pliCount: Double = 0
+    var firCount: Double = 0
+    var retransmittedPackets: Double = 0
+    var codec: String = ""
+    var decoderImplementation: String = ""
+    var powerEfficientDecoder: Bool?
+}
+
+private nonisolated struct ConnectionStatsSnapshot {
+    var rttMs: Double
+    var selectedNetworkPath: String
+}
+
+/// Audio-pipeline latency counters sampled from the full statistics report in diagnostic mode.
+/// All values cumulative (interval-averaged at log time), mirroring VideoStatsSnapshot, to
+/// pinpoint where the audio→video lag accumulates: NetEQ jitter buffer vs device playout.
+private nonisolated struct AudioSyncStatsSnapshot {
+    var timestampUs: Double = 0
+    var packetsReceived: Double = 0
+    var packetsLost: Double = 0
+    var jitterSeconds: Double = 0
+    var jitterBufferDelaySeconds: Double = 0
+    var jitterBufferTargetDelaySeconds: Double = 0
+    var jitterBufferMinimumDelaySeconds: Double = 0
+    var jitterBufferEmittedCount: Double = 0
+    var concealedSamples: Double = 0
+    var insertedSamplesForDeceleration: Double = 0
+    var removedSamplesForAcceleration: Double = 0
+    var totalPlayoutDelaySeconds: Double = 0
+    var playoutSamplesCount: Double = 0
+    /// estimatedPlayoutTimestamp of the audio/video inbound-rtp streams (sender clock domain).
+    /// video − audio > 0 means audio is playing older media, i.e. audio lags video by that much.
+    /// Requires RTCP SR from the server for the RTP→NTP mapping; nil when absent.
+    var audioPlayoutTimestampMs: Double?
+    var videoPlayoutTimestampMs: Double?
+}
+
+private nonisolated let streamStatsParsingQueue = DispatchQueue(
+    label: "com.cloudnow.stream-stats",
+    qos: .utility
+)
+
+private nonisolated let maximumInputLatencySamples = 4096
+
+/// Mutable state shared by WebRTC delegate callbacks and the latency-sensitive input sender.
+/// Every access is protected by `inputSendState`; the dispatch queue preserves packet ordering,
+/// while the lock makes the ownership boundary visible to Swift's strict-concurrency checker.
+private nonisolated struct InputSendState {
+    var reliableChannel: LKRTCDataChannel?
+    var rumbleSink: (@Sendable (Int, UInt16, UInt16) -> Void)?
+    var generated: UInt64 = 0
+    var submitted: UInt64 = 0
+    var accepted: UInt64 = 0
+    var dropped: UInt64 = 0
+    var superseded: UInt64 = 0
+    var bufferedBytes: UInt64 = 0
+    var queueWaitsNs = BoundedSampleHistory<UInt64>(capacity: maximumInputLatencySamples)
+    var queueMaxNs: UInt64 = 0
+    var latencySamplingEnabled = false
+    var newestGamepadGeneratedAt: UInt64 = 0
+    var channelState = "closed"
+    var pendingGamepadSnapshots: [Int: PendingInputSend] = [:]
+}
+
+private typealias PendingInputSend = (
+    packet: EncodedInputPacket,
+    completion: @Sendable (InputSendDisposition) -> Void
+)
+
+private nonisolated struct InputStatsSnapshot: Sendable {
+    var generated: UInt64
+    var submitted: UInt64
+    var accepted: UInt64
+    var dropped: UInt64
+    var superseded: UInt64
+    var bufferedBytes: UInt64
+    var queueP50Ns: UInt64
+    var queueP95Ns: UInt64
+    var queueMaxNs: UInt64
+    var newestGamepadAgeNs: UInt64
+    var channelState: String
+}
+
+private nonisolated struct CompletedInputSend: Sendable {
+    let completion: @Sendable (InputSendDisposition) -> Void
+    let disposition: InputSendDisposition
+}
+
+/// Identifies callbacks owned by the active peer without crossing `@MainActor` isolation.
+/// Object identifiers avoid retaining WebRTC objects through the lock.
+private nonisolated struct PeerCallbackState {
+    var peerConnectionID: ObjectIdentifier?
+    var controlChannelID: ObjectIdentifier?
+}
+
+// MARK: - GFNStreamController
+
+@Observable
+@MainActor
+final class GFNStreamController: NSObject {
+    private(set) var state: StreamState = .idle
+    private(set) var stats = StreamStats()
+    private(set) var audioStats = AudioStats()
+    private(set) var videoTrack: LKRTCVideoTrack?
+    private(set) var statsMode: StreamStatsMode = .off
+    private(set) var diagnosticsEnabled = false
+    private(set) var microphoneEnabledForConnection = false
+    private(set) var videoDiagnostics = VideoPipelineSnapshot()
+    /// Wall-clock start of the current media connection, for the HUD's duration row.
+    private(set) var streamingStartedAt: Date?
+    /// First media connection for the current server session; survives local resume.
+    private(set) var sessionStartedAt: Date?
+    /// Tier-based session deadline, resynchronized by authoritative server warnings.
+    private(set) var sessionCountdown: GFNSessionCountdown?
+    private(set) var colorState = StreamColorState(
+        preference: .automatic,
+        requestedMode: .sdr8,
+        negotiatedMode: nil,
+        detectedMode: nil,
+        displayHDRSupport: .unknown,
+        fallbackReason: nil
+    )
+    private(set) var rtcEventLogURL: URL?
+    private(set) var pingHistory: [Double] = []
+    private(set) var fpsHistory: [Double] = []
+    private(set) var bitrateHistory: [Double] = []
+    @ObservationIgnored private var pingSamples = BoundedSampleHistory<Double>(capacity: 30)
+    @ObservationIgnored private var fpsSamples = BoundedSampleHistory<Double>(capacity: 30)
+    @ObservationIgnored private var bitrateSamples = BoundedSampleHistory<Double>(capacity: 30)
+    /// Active time-limit warning from the GFN server (nil when no warning is in effect).
+    private(set) var timeWarning: StreamTimeWarning?
+    /// Incremented each time the user presses Menu while VideoSurfaceView is first responder.
+    /// SwiftUI observes this via .onChange to toggle the HUD overlay.
+    private(set) var menuPressCount: Int = 0
+    /// Incremented when the controller keyboard shortcut requests local text entry.
+    private(set) var textEntryRequestCount: Int = 0
+
+    private var peerConnection: LKRTCPeerConnection?
+    private var inputDataChannel: LKRTCDataChannel?
+    @ObservationIgnored private nonisolated let inputSendState = OSAllocatedUnfairLock(
+        initialState: InputSendState()
+    )
+    @ObservationIgnored private nonisolated let peerCallbackState = OSAllocatedUnfairLock(
+        initialState: PeerCallbackState()
+    )
+    private nonisolated let inputBackpressureHighWaterBytes: UInt64 = 512
+    private nonisolated let inputBackpressureLowWaterBytes: UInt64 = 128
+    private let inputSendQueue = DispatchQueue(
+        label: "com.cloudnow.input.send",
+        qos: .userInteractive
+    )
+    private var signaling: GFNSignalingClient?
+    private var inputSender: InputSender?
+    private(set) var videoView: VideoSurfaceView?
+    private(set) var remoteMode: RemoteInputMode = .gamepad
+    private var statsTimer: Timer?
+    private var videoReceiver: LKRTCRtpReceiver?
+    private var protocolVersion = 2
+    private var partialReliableThresholdMs = 300
+    private var gameSupportsDualShock = false
+    private var serverHidMask: UInt32 = 0
+    private var sessionInfo: SessionInfo?
+    private var membershipTier: String?
+    private var settings = StreamSettings()
+    /// Account HDR entitlement resolved from the subscription tier at connect time.
+    private var accountAllowsHDR: Bool?
+    private var micAudioSource: LKRTCAudioSource?
+    private var micAudioTrack: LKRTCAudioTrack?
+    private let audioSessionCoordinator = CloudAudioSessionCoordinator()
+    private var microphoneAuthorizedForConnection = false
+    private var connectionGeneration: UInt64 = 0
+    private var signalingComplete = false
+    private var partiallyReliableDataChannel: LKRTCDataChannel?
+    private var statsChannel: LKRTCDataChannel?
+    private var controlChannel: LKRTCDataChannel?
+    private var inputReady = false
+    private var previousVideoStats: VideoStatsSnapshot?
+    private var previousAudioSyncStats: AudioSyncStatsSnapshot?
+    private var statsTick = 0
+    private var statsGeneration = 0
+    private var videoStatsRequestInFlight = false
+    private var connectionStatsRequestInFlight = false
+    private var wasStreaming = false
+    private var reconnectAttempt = 0
+    private var reconnectTask: Task<Void, Never>?
+    private static let maxReconnectAttempts = 3
+    /// Set when the server sends an `exitMessage` (game closed, session ended, kicked). The
+    /// subsequent ICE disconnect is then treated as a normal end — not a reconnect candidate.
+    private var serverStopped = false
+    /// Set by the caller to enable auto-reconnect on ICE disconnect.
+    var onReconnectNeeded: (@MainActor () async -> SessionInfo?)?
+    private var previousSelectedCandidatePairId = ""
+    private var lastZoneRttFeedbackAt: Date?
+    private var overlayInputPaused = false
+    private var controllerTextEntryReplayLifecycle = ControllerTextEntryReplayLifecycle()
+    private var pendingControllerTextEntryReplay: PendingControllerTextEntryReplay?
+
+    // MARK: Connect
+
+    func connect(
+        session: SessionInfo,
+        settings: StreamSettings,
+        accountAllowsHDR: Bool? = nil,
+        membershipTier: String? = nil,
+        sessionStartedAt: Date? = nil,
+        supportedControls: [String]? = nil
+    ) async {
+        // Block if already active; allow from idle, disconnected, or failed (retry case)
+        let currentState = state
+        switch currentState {
+        case .connecting, .streaming:
+            gfnLog.info("connect: already \(String(describing: currentState)), ignoring")
+            return
+        default: break
+        }
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        connectionGeneration &+= 1
+        let generation = connectionGeneration
+        let settings = settings.normalizedForClient
+        let localCapabilities = LocalVideoCapabilities.detect(codec: settings.codec.resolvedCodec)
+        let colorRequest = settings.colorRequest(localCapabilities: localCapabilities, accountAllowsHDR: accountAllowsHDR)
+        gfnLog.info("connect: starting, serverIp=\(session.serverIp), signalingUrl=\(session.signalingUrl)")
+        videoColorLog.info("request preference=\(settings.colorPreference.rawValue) requested=\(colorRequest.mode.rawValue) bitDepth=\(colorRequest.bitDepth) hdr=\(colorRequest.hdrRequested) codec=\(settings.codec.rawValue) decoder10Bit=\(localCapabilities.supportsHardware10BitDecode) hdrPipeline=\(localCapabilities.supportsHDRRendering) displayHDR=\(localCapabilities.displaySupportsHDR)")
+        videoColorLog.info("chroma selected=\(settings.chromaFormat.rawValue, privacy: .public) requested=\(settings.effectiveChromaFormat.rawValue, privacy: .public) nvst=\(colorRequest.chromaFormat ?? 0)")
+        state = .connecting
+        serverStopped = false
+        sessionInfo = session
+        self.membershipTier = membershipTier
+        self.sessionStartedAt = sessionStartedAt
+        gameSupportsDualShock = GFNSonyGamepad.gameSupportsSonyInput(supportedControls)
+        self.settings = settings
+        videoView?.setAdaptiveFramePacing(settings.adaptiveFramePacing, frameRate: settings.fps)
+        self.accountAllowsHDR = accountAllowsHDR
+        colorState = StreamColorState(
+            preference: settings.colorPreference,
+            requestedMode: colorRequest.mode,
+            negotiatedMode: nil,
+            detectedMode: nil,
+            displayHDRSupport: localCapabilities.displaySupportsHDR ? .supported : .unsupported,
+            fallbackReason: nil
+        )
+        setStatsMode(settings.statsMode)
+        setDiagnosticsEnabled(settings.diagnosticsEnabled)
+        microphoneEnabledForConnection = false
+        microphoneAuthorizedForConnection = false
+        var initialStats = StreamStats()
+        initialStats.gpuType = session.gpuType ?? ""
+        initialStats.serverZone = Self.zoneShortName(from: session.zone)
+        stats = initialStats
+        audioStats = AudioStats()
+        streamingStartedAt = nil
+        sessionCountdown = nil
+        timeWarning = nil
+        inputSendQueue.sync {
+            inputSendState.withLock { state in
+                state.generated = 0
+                state.submitted = 0
+                state.accepted = 0
+                state.dropped = 0
+                state.superseded = 0
+                state.bufferedBytes = 0
+                state.queueWaitsNs.reset()
+                state.queueMaxNs = 0
+                state.newestGamepadGeneratedAt = 0
+                state.channelState = "closed"
+            }
+        }
+
+        let microphoneAuthorized = await requestMicrophonePermissionIfNeeded()
+        guard connectionGeneration == generation,
+              sessionInfo?.sessionId == session.sessionId,
+              case .connecting = state
+        else { return }
+        microphoneAuthorizedForConnection = microphoneAuthorized
+
+        let signalingClient = setupSignaling(session: session)
+        do {
+            gfnLog.info("connect: opening signaling WebSocket")
+            try await signalingClient.connect()
+            guard connectionGeneration == generation,
+                  signaling === signalingClient,
+                  case .connecting = state
+            else {
+                signalingClient.disconnect()
+                return
+            }
+            gfnLog.info("connect: signaling connected")
+        } catch {
+            guard connectionGeneration == generation,
+                  signaling === signalingClient,
+                  case .connecting = state
+            else {
+                signalingClient.disconnect()
+                return
+            }
+            gfnLog.error("connect: signaling FAILED: \(error)")
+            state = .failed(message: error.localizedDescription)
+        }
+    }
+
+    // MARK: Video View Binding
+
+    /// Called by VideoSurfaceViewRepresentable once the UIView is created.
+    /// Stores a reference so the inputHandler can be wired up when InputSender starts.
+    func bindVideoView(_ view: VideoSurfaceView) {
+        videoView = view
+        view.setAdaptiveFramePacing(settings.adaptiveFramePacing, frameRate: settings.fps)
+        view.setDiagnosticsEnabled(diagnosticsEnabled)
+        view.onDecodedVideoFormatChanged = { [weak self] format in
+            Task { @MainActor [weak self] in
+                self?.applyDecodedVideoFormat(format)
+            }
+        }
+        view.inputHandler = inputSender
+        view.menuPressHandler = { [weak self] in self?.handleMenuPress() }
+    }
+
+    /// Sets the statistics HUD level. Core stream health remains sampled for the pause menu,
+    /// while per-packet input-latency sampling runs only for a visible HUD or diagnostics.
+    func setStatsMode(_ mode: StreamStatsMode) {
+        let changed = statsMode != mode
+        statsMode = mode
+        if changed {
+            resetInputLatencyPresentation()
+        }
+        updateInputLatencySampling(resetSamples: changed)
+    }
+
+    /// Enables developer diagnostics: video-pipeline tracing, AudioSync logging, and the
+    /// debug stats rows. Orthogonal to the statistics HUD level.
+    func setDiagnosticsEnabled(_ enabled: Bool) {
+        guard diagnosticsEnabled != enabled else { return }
+        diagnosticsEnabled = enabled
+        videoView?.setDiagnosticsEnabled(enabled)
+        resetInputLatencyPresentation()
+        updateInputLatencySampling(resetSamples: true)
+    }
+
+    private func updateInputLatencySampling(resetSamples: Bool = false) {
+        let enabled = statsMode != .off || diagnosticsEnabled
+        inputSendQueue.async { [weak self] in
+            guard let self else { return }
+            inputSendState.withLock { state in
+                state.latencySamplingEnabled = enabled
+                guard resetSamples || !enabled else { return }
+                state.queueWaitsNs.reset()
+                state.queueMaxNs = 0
+            }
+        }
+    }
+
+    private func resetInputLatencyPresentation() {
+        updateStats {
+            $0.inputQueueP50Ms = 0
+            $0.inputQueueP95Ms = 0
+            $0.inputQueueMaxMs = 0
+        }
+    }
+
+    private func updateStats(_ update: (inout StreamStats) -> Void) {
+        var next = stats
+        update(&next)
+        guard next != stats else { return }
+        stats = next
+    }
+
+    private func updateAudioStats(_ update: (inout AudioStats) -> Void) {
+        var next = audioStats
+        update(&next)
+        guard next != audioStats else { return }
+        audioStats = next
+    }
+
+    @discardableResult
+    func startRtcEventLog(maxSizeBytes: Int64 = 15 * 1024 * 1024) -> URL? {
+        guard let peerConnection else { return nil }
+        stopRtcEventLog()
+
+        let fileManager = FileManager.default
+        guard let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let directory = caches.appendingPathComponent("RTCEventLogs", isDirectory: true)
+        do {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            try pruneRtcEventLogs(in: directory, keeping: 2)
+        } catch {
+            gfnLog.warning("[Stats] Unable to prepare RTC event log directory: \(error, privacy: .private)")
+            return nil
+        }
+
+        let formatter = ISO8601DateFormatter()
+        let filename = "rtc-\(formatter.string(from: Date()).replacingOccurrences(of: ":", with: "-"))-\(UUID().uuidString).log"
+        let url = directory.appendingPathComponent(filename)
+        guard peerConnection.startRtcEventLog(
+            withFilePath: url.path,
+            maxSizeInBytes: max(1_048_576, maxSizeBytes)
+        ) else { return nil }
+
+        rtcEventLogURL = url
+        return url
+    }
+
+    func stopRtcEventLog() {
+        guard rtcEventLogURL != nil else { return }
+        peerConnection?.stopRtcEventLog()
+        rtcEventLogURL = nil
+    }
+
+    /// Invoked by VideoSurfaceView when the user presses Menu.
+    /// Incrementing the counter lets SwiftUI's .onChange react without depending
+    /// on the tvOS focus engine (which is suppressed when UIKit holds first responder).
+    func handleMenuPress() {
+        menuPressCount += 1
+    }
+
+    // MARK: Input Control
+
+    func toggleRemoteMode() {
+        inputSender?.toggleRemoteMode()
+    }
+
+    func setOverlayInputPaused(_ paused: Bool) {
+        overlayInputPaused = paused
+        syncInputPauseState()
+    }
+
+    func beginControllerTextEntry() {
+        guard state == .streaming,
+              !controllerTextEntryReplayLifecycle.controllerTextEntryActive,
+              pendingControllerTextEntryReplay == nil
+        else { return }
+        controllerTextEntryReplayLifecycle.beginTextEntry()
+        syncInputPauseState()
+        textEntryRequestCount += 1
+    }
+
+    func cancelControllerTextEntry() {
+        invalidateControllerTextEntryReplay()
+    }
+
+    func submitControllerTextEntry(
+        _ text: String,
+        completion: @escaping @MainActor @Sendable (ControllerTextEntrySubmissionResult) -> Void
+    ) {
+        guard let inputSender else {
+            invalidateControllerTextEntryReplay()
+            completion(.sendFailed)
+            return
+        }
+
+        guard pendingControllerTextEntryReplay == nil,
+              let replayToken = controllerTextEntryReplayLifecycle.prepareReplay()
+        else { return }
+        pendingControllerTextEntryReplay = PendingControllerTextEntryReplay(
+            token: replayToken,
+            completion: completion
+        )
+        let result = inputSender.replaySubmittedText(text) { [weak self] replayResult in
+            Task { @MainActor [weak self] in
+                self?.finishControllerTextEntryReplay(
+                    replayToken,
+                    result: replayResult == .completed ? .accepted : .sendFailed
+                )
+            }
+        }
+        switch result {
+        case .supported:
+            controllerTextEntryReplayLifecycle.acceptReplay(replayToken)
+            syncInputPauseState()
+        case .unsupportedCharacters:
+            rejectControllerTextEntryReplay(replayToken)
+            completion(.unsupportedCharacters)
+        case .unsupportedLayout:
+            rejectControllerTextEntryReplay(replayToken)
+            completion(.unsupportedKeyboardLayout)
+        case .tooLong:
+            rejectControllerTextEntryReplay(replayToken)
+            completion(.tooLong)
+        }
+    }
+
+    // MARK: Fail (external error surfacing)
+
+    func fail(with message: String) {
+        state = .failed(message: message)
+    }
+
+    private func resetInputTransport(disableLatencySampling: Bool) {
+        let pending = inputSendQueue.sync {
+            inputSendState.withLock { state in
+                state.reliableChannel = nil
+                state.rumbleSink = nil
+                if disableLatencySampling {
+                    state.latencySamplingEnabled = false
+                }
+                state.bufferedBytes = 0
+                state.channelState = "closed"
+                state.queueWaitsNs.reset()
+                state.queueMaxNs = 0
+                let pending = Array(state.pendingGamepadSnapshots.values)
+                state.pendingGamepadSnapshots.removeAll()
+                state.dropped &+= UInt64(pending.count)
+                return pending
+            }
+        }
+        pending.forEach { $0.completion(.channelUnavailable) }
+    }
+
+    private func setActivePeerConnection(_ newPeerConnection: LKRTCPeerConnection?) {
+        peerCallbackState.withLock { state in
+            state.peerConnectionID = newPeerConnection.map(ObjectIdentifier.init)
+            state.controlChannelID = nil
+        }
+        peerConnection = newPeerConnection
+        controlChannel = nil
+        serverHidMask = 0
+    }
+
+    private nonisolated func registerControlChannel(
+        _ dataChannel: LKRTCDataChannel,
+        for sourcePeerConnection: LKRTCPeerConnection
+    ) -> Bool {
+        peerCallbackState.withLock { state in
+            guard state.peerConnectionID == ObjectIdentifier(sourcePeerConnection) else {
+                return false
+            }
+            state.controlChannelID = ObjectIdentifier(dataChannel)
+            return true
+        }
+    }
+
+    private nonisolated func isCurrentControlChannel(_ dataChannel: LKRTCDataChannel) -> Bool {
+        peerCallbackState.withLock { state in
+            state.controlChannelID == ObjectIdentifier(dataChannel)
+        }
+    }
+
+    // MARK: Disconnect
+
+    func disconnect() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        connectionGeneration &+= 1
+        onReconnectNeeded = nil
+        stopRtcEventLog()
+        stopStatsTimer()
+        wasStreaming = false
+        reconnectAttempt = 0
+        serverStopped = false
+        invalidateControllerTextEntryReplay()
+        inputSender?.stop()
+        inputSendQueue.sync {}
+        signaling?.disconnect()
+        signaling = nil
+        videoView?.videoTrack = nil
+        let activePeerConnection = peerConnection
+        setActivePeerConnection(nil)
+        activePeerConnection?.close()
+        inputDataChannel = nil
+        resetInputTransport(disableLatencySampling: true)
+        inputSender = nil
+        partiallyReliableDataChannel = nil
+        statsChannel = nil
+        videoTrack = nil
+        videoReceiver = nil
+        micAudioTrack = nil
+        micAudioSource = nil
+        microphoneEnabledForConnection = false
+        microphoneAuthorizedForConnection = false
+        pingSamples.reset()
+        fpsSamples.reset()
+        bitrateSamples.reset()
+        pingHistory = []
+        fpsHistory = []
+        bitrateHistory = []
+        streamingStartedAt = nil
+        sessionStartedAt = nil
+        sessionCountdown = nil
+        membershipTier = nil
+        signalingComplete = false
+        inputReady = false
+        gameSupportsDualShock = false
+        previousVideoStats = nil
+        statsTick = 0
+        previousSelectedCandidatePairId = ""
+        lastZoneRttFeedbackAt = nil
+        videoView?.inputHandler = nil
+        videoView?.menuPressHandler = nil
+        videoView?.onDecodedVideoFormatChanged = nil
+        videoView = nil
+        remoteMode = .gamepad
+        menuPressCount = 0
+        textEntryRequestCount = 0
+        timeWarning = nil
+        videoDiagnostics = VideoPipelineSnapshot()
+        colorState = StreamColorState(
+            preference: .automatic,
+            requestedMode: .sdr8,
+            negotiatedMode: nil,
+            detectedMode: nil,
+            displayHDRSupport: .unknown,
+            fallbackReason: nil
+        )
+        overlayInputPaused = false
+        controllerTextEntryReplayLifecycle.invalidate()
+        pendingControllerTextEntryReplay = nil
+        state = .idle
+    }
+
+    // MARK: Auto-Reconnect
+
+    private func attemptReconnect() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectAttempt += 1
+        let attempt = reconnectAttempt
+        gfnLog.info("attemptReconnect: attempt \(attempt)/\(Self.maxReconnectAttempts)")
+        invalidateControllerTextEntryReplay()
+
+        guard attempt <= Self.maxReconnectAttempts, onReconnectNeeded != nil else {
+            gfnLog.info("attemptReconnect: giving up, showing sessionEnded")
+            state = .sessionEnded
+            return
+        }
+
+        state = .reconnecting(attempt: attempt)
+
+        // Tear down current peer connection before reconnecting
+        inputSender?.stop()
+        inputSendQueue.sync {}
+        videoView?.inputHandler = nil
+        signaling?.disconnect()
+        signaling = nil
+        let activePeerConnection = peerConnection
+        setActivePeerConnection(nil)
+        activePeerConnection?.close()
+        inputDataChannel = nil
+        partiallyReliableDataChannel = nil
+        statsChannel = nil
+        resetInputTransport(disableLatencySampling: false)
+        inputSender = nil
+        videoTrack = nil
+        micAudioTrack = nil
+        micAudioSource = nil
+        microphoneEnabledForConnection = false
+        signalingComplete = false
+        inputReady = false
+
+        let delays: [TimeInterval] = [0.5, 1.0, 2.0]
+        let delay = delays[min(attempt - 1, delays.count - 1)]
+        let generation = connectionGeneration
+
+        reconnectTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self else { return }
+            guard isCurrentReconnect(generation: generation, attempt: attempt) else { return }
+
+            guard let reclaim = onReconnectNeeded else { return }
+            let reclaimedSession = await reclaim()
+            guard isCurrentReconnect(generation: generation, attempt: attempt) else { return }
+            guard let session = reclaimedSession else {
+                gfnLog.info("attemptReconnect: reclaim failed on attempt \(attempt)")
+                finishFailedReconnect(attempt: attempt)
+                return
+            }
+
+            gfnLog.info("attemptReconnect: reclaimed session, reconnecting WebRTC")
+            sessionInfo = session
+            let signalingClient = setupSignaling(session: session)
+            do {
+                try await signalingClient.connect()
+                guard isCurrentReconnect(generation: generation, attempt: attempt) else {
+                    signalingClient.disconnect()
+                    return
+                }
+                reconnectTask = nil
+            } catch {
+                guard isCurrentReconnect(generation: generation, attempt: attempt) else {
+                    signalingClient.disconnect()
+                    return
+                }
+                gfnLog.error("attemptReconnect: signaling failed: \(error)")
+                finishFailedReconnect(attempt: attempt)
+            }
+        }
+    }
+
+    private func finishFailedReconnect(attempt: Int) {
+        reconnectTask = nil
+        if attempt >= Self.maxReconnectAttempts {
+            state = .sessionEnded
+        } else {
+            attemptReconnect()
+        }
+    }
+
+    private func isCurrentReconnect(generation: UInt64, attempt: Int) -> Bool {
+        guard !Task.isCancelled,
+              connectionGeneration == generation,
+              case let .reconnecting(currentAttempt) = state,
+              currentAttempt == attempt else { return false }
+        return true
+    }
+
+    // MARK: Private — Signaling Setup
+
+    private func setupSignaling(session: SessionInfo) -> GFNSignalingClient {
+        let client = GFNSignalingClient(
+            signalingUrl: session.signalingUrl,
+            sessionId: session.sessionId,
+            serverIp: session.serverIp,
+            resolution: settings.resolution
+        )
+        client.onEvent = { [weak self, weak client] event in
+            Task { @MainActor [weak self, weak client] in
+                guard let self, let client, signaling === client else { return }
+                await handleSignalingEvent(event, sourceClient: client)
+            }
+        }
+        signaling = client
+        return client
+    }
+
+    private func handleSignalingEvent(
+        _ event: SignalingEvent,
+        sourceClient: GFNSignalingClient
+    ) async {
+        switch event {
+        case .connected:
+            break
+        case let .offer(sdp, nvstSdp):
+            await handleOffer(sdp: sdp, nvstSdp: nvstSdp, signalingClient: sourceClient)
+        case let .remoteICE(candidate, sdpMid, sdpMLineIndex):
+            addRemoteICE(candidate: candidate, sdpMid: sdpMid, sdpMLineIndex: sdpMLineIndex)
+        case let .disconnected(reason):
+            // Always stop the signaling client — kills heartbeat and releases the connection.
+            sourceClient.disconnect()
+            let establishing = switch state {
+            case .connecting, .reconnecting: true
+            default: false
+            }
+            if signalingComplete {
+                // Server closes the WebSocket after answer + ICE exchange — expected GFN behavior.
+                // The media runs over WebRTC ICE/DTLS/SRTP; let ICE state drive the outcome.
+                gfnLog.info("[Stream] Signaling closed after setup (expected): \(reason, privacy: .public)")
+            } else {
+                signaling = nil
+                if establishing, !serverStopped, onReconnectNeeded != nil {
+                    // Signaling closed before setup completed. On a resume this is GFN's RESUME
+                    // host-rotation race — a freshly-claimed media host isn't ready yet and drops
+                    // the peer (peerRemoved). Reclaim to a fresh host and retry (bounded, with
+                    // backoff) instead of dead-ending on a transient failure the user would
+                    // otherwise have to fix by hand.
+                    gfnLog.info("signaling closed before setup (\(reason, privacy: .public)); reclaiming to a fresh host")
+                    attemptReconnect()
+                } else {
+                    state = .disconnected(reason: reason)
+                }
+            }
+        case let .error(msg):
+            state = .failed(message: msg)
+        case .log:
+            break
+        }
+    }
+
+    // MARK: Private — WebRTC Peer Connection
+
+    private func configureAudioSession(microphoneRequested: Bool) -> Bool {
+        let audioSession = AVAudioSession.sharedInstance()
+        if microphoneRequested {
+            logAudioSessionInputDiagnostics(audioSession, stage: "before microphone configuration")
+        }
+        let routeReady = audioSessionCoordinator.configure(
+            microphoneAuthorized: microphoneRequested
+        )
+        if routeReady {
+            gfnLog.info("[Stream] AVAudioSession configured for playback + microphone")
+        } else if microphoneRequested {
+            gfnLog.info(
+                "[Stream] Microphone authorized; capture awaits an input route"
+            )
+        } else {
+            gfnLog.info("[Stream] AVAudioSession configured for playback")
+        }
+        logAudioSessionConfiguration(audioSession)
+        return routeReady
+    }
+
+    private func configurePlaybackAudioSession(_ audioSession: AVAudioSession) -> Bool {
+        audioSessionCoordinator.configurePlayback()
+        logAudioSessionConfiguration(audioSession)
+        return false
+    }
+
+    private func logAudioSessionInputDiagnostics(_ session: AVAudioSession, stage: String) {
+        let availableInputs = session.availableInputs?
+            .map(\.portType.rawValue)
+            .joined(separator: ", ") ?? "none"
+        let preferredInput = session.preferredInput
+            .map(\.portType.rawValue) ?? "none"
+        let routeInputs = session.currentRoute.inputs
+            .map(\.portType.rawValue)
+            .joined(separator: ", ")
+        let routeOutputs = session.currentRoute.outputs
+            .map(\.portType.rawValue)
+            .joined(separator: ", ")
+        let message = "audio input \(stage) | category \(session.category.rawValue) " +
+            "mode \(session.mode.rawValue) options \(session.categoryOptions.rawValue) | " +
+            "available \(session.isInputAvailable) " +
+            "channels \(session.inputNumberOfChannels) | preferred [\(preferredInput)] " +
+            "availableInputs [\(availableInputs)] | route inputs [\(routeInputs)] " +
+            "outputs [\(routeOutputs)] | sampleRate \(session.sampleRate) " +
+            "ioBuffer \(session.ioBufferDuration)"
+        audioSyncLog.info("\(message, privacy: .public)")
+    }
+
+    /// Logs the OS-level audio output configuration — the latency layer WebRTC stats can't see.
+    /// outputLatency is the route's hardware/driver delay (HDMI vs TV speakers vs Bluetooth,
+    /// which alone can add 100–200 ms); ioBufferDuration is the render quantum.
+    private func logAudioSessionConfiguration(_ session: AVAudioSession) {
+        let route = session.currentRoute.outputs
+            .map { "\($0.portType.rawValue):\($0.portName)" }
+            .joined(separator: ", ")
+        let message = String(
+            format: "session category %@ mode %@ | sampleRate %.0f Hz ioBuffer %.1fms outputLatency %.1fms | route [%@]",
+            session.category.rawValue,
+            session.mode.rawValue,
+            session.sampleRate,
+            session.ioBufferDuration * 1000,
+            session.outputLatency * 1000,
+            route
+        )
+        audioSyncLog.info("\(message, privacy: .public)")
+    }
+
+    private func handleOffer(
+        sdp: String,
+        nvstSdp: String?,
+        signalingClient: GFNSignalingClient
+    ) async {
+        guard signaling === signalingClient, let session = sessionInfo else { return }
+        #if DEBUG
+            gfnLog.debug("[Stream] Offer SDP (\(sdp.count, privacy: .public) chars):\n\(sdp, privacy: .private)")
+        #endif
+
+        // The server offers multiopus for surround (see CloudMatchClient
+        // surroundAudioInfo); the offer is the single source of truth
+        // for the playout channel count. Must be set before the peer connection exists
+        // so the audio device initializes with the right graph.
+        let audioChannels = SDPMunger.audioChannelCount(in: sdp)
+        let audioCodec = audioChannels > 2 ? "Multiopus" : "Opus"
+        GFNAudioDevice.shared.requestedOutputChannels = audioChannels
+        updateAudioStats {
+            $0.codecName = audioCodec
+            $0.codecChannels = audioChannels
+        }
+        audioSyncLog.info("offer audio: \(audioCodec, privacy: .public) \(audioChannels)ch")
+
+        var effectiveMicrophoneEnabled = microphoneAuthorizedForConnection
+        let microphoneRouteReady = configureAudioSession(
+            microphoneRequested: effectiveMicrophoneEnabled
+        )
+
+        // The lifetime is immutable after channel creation, so resolve the server's value first.
+        if let match = sdp.range(of: #"ri\.partialReliableThresholdMs[: ]+(\d+)"#, options: .regularExpression),
+           let numMatch = sdp[match].range(of: #"\d+"#, options: .regularExpression),
+           let ms = Int(sdp[numMatch])
+        {
+            partialReliableThresholdMs = min(max(ms, 1), Int(UInt16.max))
+        }
+
+        let iceServers: [LKRTCIceServer] = session.iceServers.map {
+            LKRTCIceServer(urlStrings: $0.urls, username: $0.username, credential: $0.credential)
+        }
+        let config = LKRTCConfiguration()
+        config.iceServers = iceServers
+        config.sdpSemantics = .unifiedPlan
+        config.continualGatheringPolicy = .gatherContinually
+        config.bundlePolicy = .maxBundle
+        config.rtcpMuxPolicy = .require
+        // Keep the audio jitter buffer lean: measured NetEQ delay sat ~20 ms above its own
+        // target without ever draining (stretch -0 ms). Fast-accelerate time-compresses the
+        // excess away; the packet cap (50 × 10 ms = 500 ms) bounds worst-case buildup. The
+        // GFN server sends no RTCP SR, so WebRTC cannot lip-sync — audio latency is all we
+        // can trim, and video is rendered unbuffered by design (input latency).
+        config.audioJitterBufferFastAccelerate = true
+        config.audioJitterBufferMaxPackets = 50
+
+        let constraints = LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
+        guard let pc = CloudRTCRuntime.peerConnectionFactory.peerConnection(
+            with: config,
+            constraints: constraints,
+            delegate: self
+        ) else {
+            state = .failed(message: "Failed to create LKRTCPeerConnection")
+            return
+        }
+        setActivePeerConnection(pc)
+        serverHidMask = GFNSonyGamepad.serverHidMask(in: nvstSdp)
+        if settings.enableRtcEventLog {
+            if let url = startRtcEventLog() {
+                gfnLog.debug("[Stats] RTC event log: \(url.path, privacy: .public)")
+            } else {
+                gfnLog.warning("[Stats] Unable to start RTC event log")
+            }
+        }
+        gfnLog.info("[Stream] Peer connection created, starting offer handling")
+
+        // Reliable ordered input channel — label must match the GFN server's expected "input_channel_v1"
+        let dcConfig = LKRTCDataChannelConfiguration()
+        dcConfig.isOrdered = true
+        dcConfig.isNegotiated = false
+        if let dc = pc.dataChannel(forLabel: "input_channel_v1", configuration: dcConfig) {
+            inputDataChannel = dc
+            inputSendState.withLock { $0.reliableChannel = dc }
+            dc.delegate = self
+        }
+
+        // Partially-reliable gamepad channel — server expects this alongside the reliable one
+        let prConfig = LKRTCDataChannelConfiguration()
+        prConfig.isOrdered = false
+        prConfig.maxPacketLifeTime = Int32(partialReliableThresholdMs)
+        prConfig.isNegotiated = false
+        if let dc = pc.dataChannel(forLabel: "input_channel_partially_reliable", configuration: prConfig) {
+            partiallyReliableDataChannel = dc
+        }
+
+        // Server performance stats (game FPS, server RTD) arrive as binary messages
+        // here — same channel the official client opens for its statistics overlay.
+        let statsConfig = LKRTCDataChannelConfiguration()
+        statsConfig.isOrdered = false
+        statsConfig.maxRetransmits = 0
+        statsConfig.isNegotiated = false
+        if let dc = pc.dataChannel(forLabel: "stats_channel", configuration: statsConfig) {
+            statsChannel = dc
+            dc.delegate = self
+        }
+
+        // Attach microphone audio track if enabled (must happen before answer creation
+        // so the m=audio sendrecv line is included in the SDP)
+        if effectiveMicrophoneEnabled {
+            effectiveMicrophoneEnabled = attachMicrophone(to: pc)
+            if !effectiveMicrophoneEnabled {
+                _ = configurePlaybackAudioSession(AVAudioSession.sharedInstance())
+            } else if !microphoneRouteReady {
+                gfnLog.info("[Stream] Microphone negotiated; capture deferred until an input route appears")
+            }
+        }
+        microphoneEnabledForConnection = effectiveMicrophoneEnabled
+
+        // AV1 uses protocol v3 (partially-reliable gamepad wrapping with sequence numbers)
+        if settings.codec.resolvedCodec == .av1 {
+            protocolVersion = 3
+        }
+
+        // Fix c= placeholder IPs with the real server IP. Do NOT filter codecs here —
+        // SDPMunger.preferCodec is applied to the ANSWER instead (below), because munging
+        // the offer leaves orphaned a=ssrc-group:FEC-FR lines that cause WebRTC to reject
+        // the video m-line (port 0) when generating the answer.
+        let serverMediaIp = session.mediaConnectionInfo.flatMap { Self.extractIpFromHost($0.ip) }
+            ?? Self.extractIpFromHost(signalingClient.connectedHost)
+        let fixedSdp = serverMediaIp.map { ip in
+            Self.rewriteOfferConnectionAddresses(sdp, serverIp: ip)
+        } ?? sdp
+        if let ip = serverMediaIp {
+            gfnLog.debug("[Stream] Fixed placeholder IPs in offer SDP: 0.0.0.0/127.0.0.1 -> \(ip, privacy: .private)")
+        } else {
+            gfnLog.warning("[Stream] Warning: no server IP available — offer placeholder IPs left unchanged")
+        }
+        // Normalize H.265 fmtp in the offer before setRemoteDescription so WebRTC
+        // keeps H.265 in the generated answer (tier-flag and level-id must be valid).
+        let h265NormalizedSdp = SDPMunger.rewriteH265LevelId(SDPMunger.rewriteH265TierFlag(fixedSdp))
+        let remoteSDP = LKRTCSessionDescription(type: .offer, sdp: h265NormalizedSdp)
+        do {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                pc.setRemoteDescription(remoteSDP) { error in
+                    if let error {
+                        cont.resume(throwing: error)
+                    } else {
+                        cont.resume()
+                    }
+                }
+            }
+        } catch {
+            gfnLog.error("[Stream] setRemoteDescription failed: \(error, privacy: .private)")
+        }
+        guard ownsOffer(peerConnection: pc, signalingClient: signalingClient) else {
+            pc.close()
+            return
+        }
+
+        // Create answer
+        let answerConstraints = LKRTCMediaConstraints(
+            mandatoryConstraints: ["OfferToReceiveVideo": "true", "OfferToReceiveAudio": "true"],
+            optionalConstraints: nil
+        )
+        do {
+            let answer: LKRTCSessionDescription = try await withCheckedThrowingContinuation { cont in
+                pc.answer(for: answerConstraints) { sdp, error in
+                    if let e = error {
+                        cont.resume(throwing: e); return
+                    }
+                    if let sdp {
+                        cont.resume(returning: sdp)
+                    } else {
+                        cont.resume(throwing: StreamError.noSDP)
+                    }
+                }
+            }
+            guard ownsOffer(peerConnection: pc, signalingClient: signalingClient) else {
+                pc.close()
+                return
+            }
+            // Apply codec preference to the answer (not the offer) — avoids the
+            // orphaned FEC-FR SSRC issue that caused video port 0 when munging the offer.
+            let answerColorRequest = settings.colorRequest(localCapabilities: .detect(codec: settings.codec.resolvedCodec), accountAllowsHDR: accountAllowsHDR)
+            let codecFilteredSdp = SDPMunger.preferCodec(
+                answer.sdp,
+                codec: settings.codec.resolvedCodec,
+                preferTenBit: answerColorRequest.bitDepth >= 10
+            )
+            // For H.265: rewrite tier-flag=1→0 and cap level-id to hardware-safe values.
+            // Apple's decoder may reject High-tier or above-spec level-id advertisements.
+            let h265SafeSdp = settings.codec.resolvedCodec == .h265
+                ? SDPMunger.rewriteH265LevelId(SDPMunger.rewriteH265TierFlag(codecFilteredSdp))
+                : codecFilteredSdp
+            // Audio: strip RED (jitter-buffer latency) or, for surround offers, rebuild the
+            // audio section to accept multiopus — createAnswer rejects codecs it does not
+            // advertise, which would otherwise break the whole bundle.
+            let audioMungedSdp = SDPMunger.mungeAudioAnswer(
+                SDPMunger.injectBandwidth(h265SafeSdp, videoKbps: settings.maxBitrateKbps),
+                offer: fixedSdp
+            )
+            let mangledAnswerSdp = audioMungedSdp
+            let answerH265Params = mangledAnswerSdp.components(separatedBy: "\r\n")
+                .filter { ($0.hasPrefix("a=rtpmap:") && $0.contains("H265")) || ($0.hasPrefix("a=fmtp:") && $0.contains("profile-id")) }
+                .joined(separator: " ")
+            videoColorLog.info("answer H265: \(answerH265Params.isEmpty ? "none" : answerH265Params)")
+            #if DEBUG
+                gfnLog.debug("[Stream] Answer SDP (\(mangledAnswerSdp.count, privacy: .public) chars):\n\(mangledAnswerSdp, privacy: .private)")
+            #endif
+
+            // Set local description
+            let localSDP = LKRTCSessionDescription(type: .answer, sdp: mangledAnswerSdp)
+            do {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                    pc.setLocalDescription(localSDP) { error in
+                        if let error {
+                            cont.resume(throwing: error)
+                        } else {
+                            cont.resume()
+                        }
+                    }
+                }
+            } catch {
+                gfnLog.error("[Stream] setLocalDescription failed: \(error, privacy: .private)")
+            }
+            guard ownsOffer(peerConnection: pc, signalingClient: signalingClient) else {
+                pc.close()
+                return
+            }
+            let (iceUfrag, icePwd, dtlsFingerprint) = Self.extractIceCredentials(from: mangledAnswerSdp)
+            signalingClient.sendAnswer(
+                sdp: mangledAnswerSdp,
+                nvstSdp: buildNvstSdp(
+                    settings: settings,
+                    iceUfrag: iceUfrag,
+                    icePwd: icePwd,
+                    dtlsFingerprint: dtlsFingerprint,
+                    microphoneEnabled: effectiveMicrophoneEnabled
+                )
+            )
+            signalingComplete = true
+
+            // Inject the server's ICE host candidate AFTER sending the answer.
+            // GFN offers have no a=candidate: lines — the server relies on the client to probe it.
+            // Primary source: mediaConnectionInfo (usage=2, or usage=14 highest-port fallback).
+            // Fallback: all DNS-resolved IPs for the signaling hostname + SDP m-line port.
+            let mciIp = session.mediaConnectionInfo.flatMap { Self.extractIpFromHost($0.ip) }
+            let mciPort = session.mediaConnectionInfo?.port ?? 0
+
+            let sdpPort = sdp.components(separatedBy: "\r\n").compactMap { line -> Int? in
+                guard line.hasPrefix("m=") else { return nil }
+                let p = line.components(separatedBy: " ")
+                guard p.count >= 2, let port = Int(p[1]), port > 9 else { return nil }
+                return port
+            }.first ?? 0
+
+            // Saturate ICE with every plausible server endpoint.
+            // We don't know which port carries UDP media (usage=2 is absent for this zone),
+            // so we inject candidates for ALL combinations of known IPs × known ports.
+            // ICE probes them all simultaneously and succeeds on the first STUN reply.
+            let resolvedIps = signalingClient.resolvedIPs
+            let connectedHost = signalingClient.connectedHost
+            var allIps: [String] = []
+            if let ip = mciIp {
+                allIps.append(ip)
+            }
+            for ip in resolvedIps where !allIps.contains(ip) {
+                allIps.append(ip)
+            }
+            if !connectedHost.isEmpty, !allIps.contains(connectedHost) {
+                allIps.append(connectedHost)
+            }
+
+            let allPorts = [mciPort, sdpPort].filter { $0 > 0 }
+            let pairs = allIps.flatMap { ip in allPorts.map { (ip, $0) } }
+
+            if pairs.isEmpty {
+                gfnLog.warning("[ICE] No server IPs or ports available — ICE candidate injection skipped")
+            } else {
+                gfnLog.debug("[ICE] Injecting \(pairs.count, privacy: .public) candidate(s) (mciIp=\(mciIp ?? "nil", privacy: .private) mciPort=\(mciPort, privacy: .public) sdpPort=\(sdpPort, privacy: .public))")
+                for (i, (ip, port)) in pairs.enumerated() {
+                    guard ownsOffer(peerConnection: pc, signalingClient: signalingClient) else {
+                        pc.close()
+                        return
+                    }
+                    let cand = LKRTCIceCandidate(
+                        sdp: "candidate:\(i + 1) 1 UDP 2130706431 \(ip) \(port) typ host",
+                        sdpMLineIndex: 0, sdpMid: "0"
+                    )
+                    try? await pc.add(cand)
+                    gfnLog.debug("[ICE]   → \(ip, privacy: .private):\(port, privacy: .public)")
+                }
+            }
+        } catch {
+            guard ownsOffer(peerConnection: pc, signalingClient: signalingClient) else { return }
+            state = .failed(message: "Answer creation failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func ownsOffer(
+        peerConnection: LKRTCPeerConnection,
+        signalingClient: GFNSignalingClient
+    ) -> Bool {
+        self.peerConnection === peerConnection && signaling === signalingClient
+    }
+
+    // MARK: Private — NVST SDP
+
+    /// Extracts the client's ICE ufrag, ICE password, and DTLS fingerprint from an SDP string.
+    /// The GFN server reads these from the NVST SDP (not the WebRTC SDP) to validate STUN probes.
+    private static func extractIceCredentials(from sdp: String) -> (ufrag: String, pwd: String, fingerprint: String) {
+        let lines = sdp.components(separatedBy: CharacterSet.newlines)
+        let ufrag = lines.first { $0.hasPrefix("a=ice-ufrag:") }
+            .map { String($0.dropFirst("a=ice-ufrag:".count)).trimmingCharacters(in: .whitespaces) } ?? ""
+        let pwd = lines.first { $0.hasPrefix("a=ice-pwd:") }
+            .map { String($0.dropFirst("a=ice-pwd:".count)).trimmingCharacters(in: .whitespaces) } ?? ""
+        let fingerprint = lines.first { $0.hasPrefix("a=fingerprint:sha-256 ") }
+            .map { String($0.dropFirst("a=fingerprint:sha-256 ".count)).trimmingCharacters(in: .whitespaces) } ?? ""
+        return (ufrag, pwd, fingerprint)
+    }
+
+    /// Builds the NVIDIA streaming protocol capability descriptor sent alongside the WebRTC answer.
+    /// Builds the NVST SDP capability descriptor — critically includes the client's ICE credentials so the
+    /// GFN server can validate STUN MESSAGE-INTEGRITY on incoming binding requests.
+    func buildNvstSdp(
+        settings: StreamSettings,
+        iceUfrag: String,
+        icePwd: String,
+        dtlsFingerprint: String,
+        microphoneEnabled: Bool
+    ) -> String {
+        let resolutionParts = settings.resolution.split(separator: "x")
+        let width = Int(resolutionParts.first ?? "1920") ?? 1920
+        let height = Int(resolutionParts.last ?? "1080") ?? 1080
+        let minBitrateKbps = max(5000, settings.maxBitrateKbps * 35 / 100)
+        let initialBitrateKbps = max(minBitrateKbps, settings.maxBitrateKbps * 70 / 100)
+        let colorRequest = settings.colorRequest(
+            localCapabilities: .detect(codec: settings.codec.resolvedCodec),
+            accountAllowsHDR: accountAllowsHDR
+        )
+
+        var lines: [String] = [
+            "v=0",
+            "o=SdpTest test_id_13 14 IN IPv4 127.0.0.1",
+            "s=-",
+            "t=0 0",
+            // Client ICE credentials — GFN server uses these (not the WebRTC SDP) to validate STUN
+            "a=general.icePassword:\(icePwd)",
+            "a=general.iceUserNameFragment:\(iceUfrag)",
+            "a=general.dtlsFingerprint:\(dtlsFingerprint)",
+            // Video section with quality/bitrate hints for the server encoder
+            "m=video 0 RTP/AVP",
+            "a=msid:fbc-video-0",
+            "a=vqos.fec.rateDropWindow:10",
+            "a=vqos.fec.repairPercent:5",
+            "a=vqos.drc.enable:0",
+            "a=vqos.dfc.enable:0",
+            "a=video.enableRtpNack:1",
+            "a=video.packetSize:1140",
+            "a=bwe.useOwdCongestionControl:1",
+            "a=vqos.resControl.cpmRtc.enable:0",
+            "a=vqos.resControl.cpmRtc.minResolutionPercent:100",
+            "a=video.clientViewportWd:\(width)",
+            "a=video.clientViewportHt:\(height)",
+            "a=video.maxFPS:\(settings.fps)",
+            "a=video.initialBitrateKbps:\(initialBitrateKbps)",
+            "a=video.initialPeakBitrateKbps:\(settings.maxBitrateKbps)",
+            "a=vqos.bw.maximumBitrateKbps:\(settings.maxBitrateKbps)",
+            "a=vqos.bw.minimumBitrateKbps:\(minBitrateKbps)",
+            "a=vqos.bw.peakBitrateKbps:\(settings.maxBitrateKbps)",
+            "a=video.bitDepth:\(colorRequest.bitDepth)",
+            // NVST defaults to 4:2:0 unless the final encoder request includes chroma sampling.
+            "a=video.chromaFormat:\(colorRequest.chromaFormat ?? 0)",
+            "m=audio 0 RTP/AVP",
+            "a=msid:audio",
+        ]
+        if microphoneEnabled {
+            lines += [
+                "m=mic 0 RTP/AVP",
+                "a=msid:mic",
+                "a=rtpmap:0 PCMU/8000",
+            ]
+        }
+        lines += [
+            "m=application 0 RTP/AVP",
+            "a=msid:input_1",
+            "a=ri.partialReliableThresholdMs:\(partialReliableThresholdMs)",
+            "a=ri.hidDeviceMask:\(gameSupportsDualShock ? serverHidMask & 4 : 0)",
+            "a=ri.enablePartiallyReliableTransferGamepad:\(protocolVersion == 3 ? 65535 : 0)",
+            "a=ri.enablePartiallyReliableTransferHid:0",
+            "",
+        ]
+        return lines.joined(separator: "\r\n")
+    }
+
+    // MARK: Private — Microphone
+
+    private func requestMicrophonePermissionIfNeeded() async -> Bool {
+        await audioSessionCoordinator.requestMicrophonePermission(
+            if: settings.micEnabled
+        )
+    }
+
+    private func attachMicrophone(to pc: LKRTCPeerConnection) -> Bool {
+        guard let attachment = audioSessionCoordinator.attachMicrophone(to: pc)
+        else {
+            return false
+        }
+        micAudioSource = attachment.source
+        micAudioTrack = attachment.track
+        return true
+    }
+
+    /// Extracts a dotted-decimal IP from a hostname that encodes it as dashes,
+    /// e.g. "10-1-2-3.zone.nvidiagrid.net" → "10.1.2.3".
+    /// Returns nil if the host is already a plain IP or doesn't match the pattern.
+    private static func extractIpFromHost(_ host: String) -> String? {
+        // Already a plain dotted-decimal IP (e.g. "80.250.97.40")
+        let dotParts = host.components(separatedBy: ".")
+        if dotParts.count == 4, dotParts.allSatisfy({ Int($0) != nil }) {
+            return host
+        }
+        // Dash-encoded IP in hostname (e.g. "80-250-97-40.cloudmatchbeta.nvidiagrid.net")
+        let label = dotParts.first ?? host
+        let dashParts = label.components(separatedBy: "-")
+        guard dashParts.count == 4, dashParts.allSatisfy({ Int($0) != nil }) else { return nil }
+        return dashParts.joined(separator: ".")
+    }
+
+    private static func rewriteOfferConnectionAddresses(_ sdp: String, serverIp: String) -> String {
+        sdp
+            .replacingOccurrences(of: "c=IN IP4 0.0.0.0", with: "c=IN IP4 \(serverIp)")
+            .replacingOccurrences(of: "c=IN IP4 127.0.0.1", with: "c=IN IP4 \(serverIp)")
+            .replacingOccurrences(of: " 0.0.0.0 ", with: " \(serverIp) ")
+            .replacingOccurrences(of: " 127.0.0.1 ", with: " \(serverIp) ")
+    }
+
+    private func addRemoteICE(candidate: String, sdpMid: String?, sdpMLineIndex: Int?) {
+        gfnLog.debug("[ICE] Adding remote candidate: \(candidate, privacy: .private) mid=\(sdpMid ?? "nil", privacy: .public) mLineIndex=\(sdpMLineIndex ?? -1, privacy: .public)")
+        let ice = LKRTCIceCandidate(
+            sdp: candidate,
+            sdpMLineIndex: Int32(sdpMLineIndex ?? 0),
+            sdpMid: sdpMid
+        )
+        peerConnection?.add(ice, completionHandler: { _ in })
+    }
+
+    // MARK: Private — Stats
+
+    /// Extracts the average game FPS from a stats_channel binary message. Layout
+    /// (mirrors the official web client's parser): byte 0 is the message type —
+    /// 3: payload starts at byte 1; 4: the type byte doubles as the payload version.
+    /// Payload: u8 version (>= 4), then little-endian float64s at offsets 1
+    /// (timestamp), 9, 17 (round-trip delay) and 25 (average game FPS).
+    private nonisolated static func parseStatsChannelGameFps(_ data: Data) -> Double? {
+        guard let type = data.first else { return nil }
+        let payload: Data
+        switch type {
+        case 3: payload = data.dropFirst()
+        case 4: payload = data
+        default: return nil
+        }
+        guard payload.count >= 33, let version = payload.first, version >= 4 else { return nil }
+        let bytes = payload.subdata(in: (payload.startIndex + 25) ..< (payload.startIndex + 33))
+        let bits = bytes.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+        let value = Double(bitPattern: UInt64(littleEndian: bits))
+        guard value.isFinite, value >= 0, value < 1000 else { return nil }
+        return value
+    }
+
+    /// "https://np-frk-08.cloudmatchbeta.nvidiagrid.net/" → "FRK-08": first host label
+    /// without the "np-" prefix, uppercased — the form the official client displays.
+    private static func zoneShortName(from zone: String) -> String {
+        guard !zone.isEmpty else { return "" }
+        let host = URLComponents(string: zone)?.host ?? zone
+        var name = host.components(separatedBy: ".").first ?? host
+        if name.lowercased().hasPrefix("np-") {
+            name = String(name.dropFirst(3))
+        }
+        return name.uppercased()
+    }
+
+    private func startStatsTimer() {
+        guard statsTimer == nil else { return }
+        collectStats()
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.collectStats() }
+        }
+        statsTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopStatsTimer() {
+        statsTimer?.invalidate()
+        statsTimer = nil
+        statsGeneration &+= 1
+        videoStatsRequestInFlight = false
+        connectionStatsRequestInFlight = false
+        previousVideoStats = nil
+        previousAudioSyncStats = nil
+        statsTick = 0
+    }
+
+    private func collectStats() {
+        guard let peerConnection else { return }
+        if statsMode != .off || diagnosticsEnabled {
+            collectInputStats()
+        }
+        if diagnosticsEnabled {
+            let generation = statsGeneration
+            videoView?.captureDiagnostics { [weak self] snapshot in
+                Task { @MainActor [weak self] in
+                    guard let self, statsGeneration == generation, diagnosticsEnabled else {
+                        return
+                    }
+                    videoDiagnostics = snapshot
+                }
+            }
+        }
+        statsTick &+= 1
+        let generation = statsGeneration
+
+        if let videoReceiver, !videoStatsRequestInFlight {
+            videoStatsRequestInFlight = true
+            peerConnection.statistics(for: videoReceiver) { report in
+                streamStatsParsingQueue.async {
+                    let snapshot = Self.parseVideoStats(report)
+                    Task { @MainActor [weak self] in
+                        guard let self, statsGeneration == generation else { return }
+                        videoStatsRequestInFlight = false
+                        if let snapshot {
+                            applyVideoStats(snapshot)
+                        }
+                    }
+                }
+            }
+        }
+
+        // A visible HUD (or diagnostics) samples the full report every tick so audio rows and
+        // the AudioSync log have 1 s resolution; otherwise every 5th tick is enough for the
+        // pause menu's RTT/path display.
+        let wantFullReport = statsTick == 1 || statsTick.isMultiple(of: 5)
+            || statsMode != .off || diagnosticsEnabled
+        if wantFullReport, !connectionStatsRequestInFlight {
+            connectionStatsRequestInFlight = true
+            let wantAudio = statsMode == .standard || diagnosticsEnabled
+            peerConnection.statistics { report in
+                streamStatsParsingQueue.async {
+                    let snapshot = Self.parseConnectionStats(report)
+                    let audioSample = wantAudio ? Self.parseAudioSyncStats(report) : nil
+                    Task { @MainActor [weak self] in
+                        guard let self, statsGeneration == generation else { return }
+                        connectionStatsRequestInFlight = false
+                        if let snapshot {
+                            updateStats {
+                                $0.rttMs = snapshot.rttMs
+                                $0.selectedNetworkPath = snapshot.selectedNetworkPath
+                            }
+                        }
+                        if let audioSample {
+                            applyAudioSyncStats(audioSample)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func collectInputStats() {
+        inputSendQueue.async { [weak self] in
+            guard let self else { return }
+            let capture = inputSendState.withLock { state in
+                let capture = (
+                    waits: state.queueWaitsNs.elements,
+                    newestGamepadGeneratedAt: state.newestGamepadGeneratedAt,
+                    generated: state.generated,
+                    submitted: state.submitted,
+                    accepted: state.accepted,
+                    dropped: state.dropped,
+                    superseded: state.superseded,
+                    bufferedBytes: state.bufferedBytes,
+                    maxNs: state.queueMaxNs,
+                    channelState: state.channelState
+                )
+                state.queueWaitsNs.reset()
+                state.queueMaxNs = 0
+                return capture
+            }
+            let sortedWaits = capture.waits.sorted()
+            let p50Ns = Self.percentile(0.50, in: sortedWaits)
+            let p95Ns = Self.percentile(0.95, in: sortedWaits)
+            let now = DispatchTime.now().uptimeNanoseconds
+            let gamepadAgeNs = capture.newestGamepadGeneratedAt == 0
+                ? 0
+                : now &- capture.newestGamepadGeneratedAt
+            let snapshot = InputStatsSnapshot(
+                generated: capture.generated,
+                submitted: capture.submitted,
+                accepted: capture.accepted,
+                dropped: capture.dropped,
+                superseded: capture.superseded,
+                bufferedBytes: capture.bufferedBytes,
+                queueP50Ns: p50Ns,
+                queueP95Ns: p95Ns,
+                queueMaxNs: capture.maxNs,
+                newestGamepadAgeNs: gamepadAgeNs,
+                channelState: capture.channelState
+            )
+
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                updateStats {
+                    $0.inputGenerated = snapshot.generated
+                    $0.inputSubmitted = snapshot.submitted
+                    $0.inputAccepted = snapshot.accepted
+                    $0.inputDropped = snapshot.dropped
+                    $0.inputSuperseded = snapshot.superseded
+                    $0.inputBufferedBytes = snapshot.bufferedBytes
+                    $0.inputQueueP50Ms = Double(snapshot.queueP50Ns) / 1_000_000
+                    $0.inputQueueP95Ms = Double(snapshot.queueP95Ns) / 1_000_000
+                    $0.inputQueueMaxMs = Double(snapshot.queueMaxNs) / 1_000_000
+                    $0.newestGamepadAgeMs = Double(snapshot.newestGamepadAgeNs) / 1_000_000
+                    $0.inputChannelState = snapshot.channelState
+                }
+            }
+        }
+    }
+
+    private nonisolated static func percentile(_ percentile: Double, in sorted: [UInt64]) -> UInt64 {
+        guard !sorted.isEmpty else { return 0 }
+        let rank = Int((Double(sorted.count) * percentile).rounded(.up)) - 1
+        return sorted[min(sorted.count - 1, max(0, rank))]
+    }
+
+    private nonisolated static func parseVideoStats(_ report: LKRTCStatisticsReport) -> VideoStatsSnapshot? {
+        // Build codec name lookup: stat ID → human-readable name (e.g. "H.265", "AV1")
+        var codecNames: [String: String] = [:]
+        for (id, stat) in report.statistics where stat.type == "codec" {
+            if let mime = stat.values["mimeType"] as? String {
+                let raw = mime.components(separatedBy: "/").last ?? mime
+                switch raw.uppercased() {
+                case "H264": codecNames[id] = "H.264"
+                case "H265", "HEVC": codecNames[id] = "H.265"
+                case "AV01", "AV1": codecNames[id] = "AV1"
+                default: codecNames[id] = raw
+                }
+            }
+        }
+
+        guard let stat = report.statistics.values.first(where: {
+            $0.type == "inbound-rtp" && $0.values["kind"] as? String == "video"
+        }) else { return nil }
+
+        let codecId = stat.values["codecId"] as? String ?? ""
+        return VideoStatsSnapshot(
+            timestampUs: stat.timestamp_us,
+            bytesReceived: numericValue(stat.values["bytesReceived"]),
+            packetsReceived: numericValue(stat.values["packetsReceived"]),
+            packetsLost: numericValue(stat.values["packetsLost"]),
+            framesDecoded: numericValue(stat.values["framesDecoded"]),
+            framesDropped: numericValue(stat.values["framesDropped"]),
+            framesPerSecond: numericValue(stat.values["framesPerSecond"]),
+            frameWidth: numericValue(stat.values["frameWidth"]),
+            frameHeight: numericValue(stat.values["frameHeight"]),
+            jitterSeconds: numericValue(stat.values["jitter"]),
+            jitterBufferDelaySeconds: numericValue(stat.values["jitterBufferDelay"]),
+            jitterBufferTargetDelaySeconds: numericValue(stat.values["jitterBufferTargetDelay"]),
+            jitterBufferMinimumDelaySeconds: numericValue(stat.values["jitterBufferMinimumDelay"]),
+            jitterBufferEmittedCount: numericValue(stat.values["jitterBufferEmittedCount"]),
+            totalDecodeTimeSeconds: numericValue(stat.values["totalDecodeTime"]),
+            totalProcessingDelaySeconds: numericValue(stat.values["totalProcessingDelay"]),
+            freezeCount: numericValue(stat.values["freezeCount"]),
+            totalFreezeDurationSeconds: numericValue(stat.values["totalFreezesDuration"]),
+            nackCount: numericValue(stat.values["nackCount"]),
+            pliCount: numericValue(stat.values["pliCount"]),
+            firCount: numericValue(stat.values["firCount"]),
+            retransmittedPackets: numericValue(stat.values["retransmittedPacketsReceived"]),
+            codec: codecNames[codecId] ?? codecId,
+            decoderImplementation: stat.values["decoderImplementation"] as? String ?? "",
+            powerEfficientDecoder: boolValue(stat.values["powerEfficientDecoder"])
+        )
+    }
+
+    private nonisolated static func parseConnectionStats(_ report: LKRTCStatisticsReport) -> ConnectionStatsSnapshot? {
+        var candidateDetails: [String: (protocolName: String, candidateType: String)] = [:]
+        var candidatePairs: [String: (localID: String, remoteID: String, rttMs: Double, nominated: Bool)] = [:]
+        var selectedCandidatePairID: String?
+
+        for (id, stat) in report.statistics {
+            if stat.type == "local-candidate" || stat.type == "remote-candidate" {
+                candidateDetails[id] = (
+                    protocolName: (stat.values["protocol"] as? String ?? "").lowercased(),
+                    candidateType: (stat.values["candidateType"] as? String ?? "").lowercased()
+                )
+            } else if stat.type == "transport" {
+                selectedCandidatePairID = stat.values["selectedCandidatePairId"] as? String
+                    ?? selectedCandidatePairID
+            } else if stat.type == "candidate-pair",
+                      stat.values["state"] as? String == "succeeded"
+            {
+                candidatePairs[id] = (
+                    localID: stat.values["localCandidateId"] as? String ?? "",
+                    remoteID: stat.values["remoteCandidateId"] as? String ?? "",
+                    rttMs: numericValue(stat.values["currentRoundTripTime"]) * 1000,
+                    nominated: boolValue(stat.values["nominated"]) ?? false
+                )
+            }
+        }
+
+        let selectedPair = selectedCandidatePairID.flatMap { candidatePairs[$0] }
+            ?? candidatePairs.values.first(where: \.nominated)
+            ?? candidatePairs.values.first
+        guard let selectedPair else { return nil }
+
+        let local = candidateDetails[selectedPair.localID]
+        let remote = candidateDetails[selectedPair.remoteID]
+        let protocolName = local?.protocolName.isEmpty == false
+            ? local?.protocolName ?? ""
+            : remote?.protocolName ?? ""
+        let usesRelay = local?.candidateType == "relay" || remote?.candidateType == "relay"
+        let selectedNetworkPath = if protocolName == "tcp" || protocolName == "tls" {
+            "tcp_tls_fallback"
+        } else if usesRelay, protocolName == "udp" {
+            "turn_udp_relay"
+        } else if protocolName == "udp" {
+            "direct_udp"
+        } else {
+            "unknown"
+        }
+        return ConnectionStatsSnapshot(
+            rttMs: selectedPair.rttMs,
+            selectedNetworkPath: selectedNetworkPath
+        )
+    }
+
+    /// Extracts the audio-pipeline latency stats needed to diagnose audio↔video desync:
+    /// NetEQ jitter-buffer delays (inbound-rtp kind=audio), device-side playout delay
+    /// (media-playout), and both estimated playout timestamps for the direct A/V offset.
+    private nonisolated static func parseAudioSyncStats(_ report: LKRTCStatisticsReport) -> AudioSyncStatsSnapshot? {
+        guard let audio = report.statistics.values.first(where: {
+            $0.type == "inbound-rtp" && $0.values["kind"] as? String == "audio"
+        }) else { return nil }
+
+        var snapshot = AudioSyncStatsSnapshot()
+        snapshot.timestampUs = Double(audio.timestamp_us)
+        snapshot.packetsReceived = numericValue(audio.values["packetsReceived"])
+        snapshot.packetsLost = numericValue(audio.values["packetsLost"])
+        snapshot.jitterSeconds = numericValue(audio.values["jitter"])
+        snapshot.jitterBufferDelaySeconds = numericValue(audio.values["jitterBufferDelay"])
+        snapshot.jitterBufferTargetDelaySeconds = numericValue(audio.values["jitterBufferTargetDelay"])
+        snapshot.jitterBufferMinimumDelaySeconds = numericValue(audio.values["jitterBufferMinimumDelay"])
+        snapshot.jitterBufferEmittedCount = numericValue(audio.values["jitterBufferEmittedCount"])
+        snapshot.concealedSamples = numericValue(audio.values["concealedSamples"])
+        snapshot.insertedSamplesForDeceleration = numericValue(audio.values["insertedSamplesForDeceleration"])
+        snapshot.removedSamplesForAcceleration = numericValue(audio.values["removedSamplesForAcceleration"])
+        snapshot.audioPlayoutTimestampMs = (audio.values["estimatedPlayoutTimestamp"] as? NSNumber)?.doubleValue
+
+        if let playout = report.statistics.values.first(where: { $0.type == "media-playout" }) {
+            snapshot.totalPlayoutDelaySeconds = numericValue(playout.values["totalPlayoutDelay"])
+            snapshot.playoutSamplesCount = numericValue(playout.values["totalSamplesCount"])
+        }
+        if let video = report.statistics.values.first(where: {
+            $0.type == "inbound-rtp" && $0.values["kind"] as? String == "video"
+        }) {
+            snapshot.videoPlayoutTimestampMs = (video.values["estimatedPlayoutTimestamp"] as? NSNumber)?.doubleValue
+        }
+        return snapshot
+    }
+
+    private nonisolated static func numericValue(_ value: Any?) -> Double {
+        (value as? NSNumber)?.doubleValue ?? 0
+    }
+
+    private nonisolated static func boolValue(_ value: Any?) -> Bool? {
+        (value as? NSNumber)?.boolValue
+    }
+
+    private func applyVideoStats(_ sample: VideoStatsSnapshot) {
+        var next = stats
+        next.fps = sample.framesPerSecond
+        next.resolutionWidth = Int(sample.frameWidth)
+        next.resolutionHeight = Int(sample.frameHeight)
+        next.codec = sample.codec
+        next.jitterMs = sample.jitterSeconds * 1000
+        next.decoderImplementation = sample.decoderImplementation
+        next.powerEfficientDecoder = sample.powerEfficientDecoder
+
+        if let previous = previousVideoStats {
+            let elapsedSeconds = (sample.timestampUs - previous.timestampUs) / 1_000_000
+            if elapsedSeconds > 0 {
+                next.bitrateKbps = Int(
+                    max(0, sample.bytesReceived - previous.bytesReceived) * 8 / elapsedSeconds / 1000
+                )
+            }
+
+            let received = max(0, sample.packetsReceived - previous.packetsReceived)
+            let lost = max(0, sample.packetsLost - previous.packetsLost)
+            if received + lost > 0 {
+                next.packetLossPercent = lost / (received + lost) * 100
+            }
+
+            let emitted = max(0, sample.jitterBufferEmittedCount - previous.jitterBufferEmittedCount)
+            next.jitterBufferDelayMs = intervalAverage(
+                sample.jitterBufferDelaySeconds,
+                previous.jitterBufferDelaySeconds,
+                count: emitted
+            )
+            next.jitterBufferTargetDelayMs = intervalAverage(
+                sample.jitterBufferTargetDelaySeconds,
+                previous.jitterBufferTargetDelaySeconds,
+                count: emitted
+            )
+            next.jitterBufferMinimumDelayMs = intervalAverage(
+                sample.jitterBufferMinimumDelaySeconds,
+                previous.jitterBufferMinimumDelaySeconds,
+                count: emitted
+            )
+
+            let decoded = max(0, sample.framesDecoded - previous.framesDecoded)
+            next.decodeTimeMs = intervalAverage(
+                sample.totalDecodeTimeSeconds,
+                previous.totalDecodeTimeSeconds,
+                count: decoded
+            )
+            next.processingDelayMs = intervalAverage(
+                sample.totalProcessingDelaySeconds,
+                previous.totalProcessingDelaySeconds,
+                count: decoded
+            )
+            next.framesDropped = intervalCount(sample.framesDropped, previous.framesDropped)
+            next.freezeCount = intervalCount(sample.freezeCount, previous.freezeCount)
+            next.freezeDurationMs = max(
+                0,
+                sample.totalFreezeDurationSeconds - previous.totalFreezeDurationSeconds
+            ) * 1000
+            next.nackCount = intervalCount(sample.nackCount, previous.nackCount)
+            next.pliCount = intervalCount(sample.pliCount, previous.pliCount)
+            next.firCount = intervalCount(sample.firCount, previous.firCount)
+            next.retransmittedPackets = intervalCount(
+                sample.retransmittedPackets,
+                previous.retransmittedPackets
+            )
+        }
+
+        previousVideoStats = sample
+        if next != stats {
+            stats = next
+        }
+        pingSamples.append(next.rttMs)
+        fpsSamples.append(next.fps)
+        bitrateSamples.append(Double(next.bitrateKbps) / 1000.0)
+        pingHistory = pingSamples.elements
+        fpsHistory = fpsSamples.elements
+        bitrateHistory = bitrateSamples.elements
+    }
+
+    private func applyDecodedVideoFormat(_ format: DecodedVideoFormat) {
+        videoColorLog.info(
+            "decoded mode=\(format.mode.rawValue) path=\(format.decoderPath.rawValue) \(format.width)x\(format.height) pixelFormat=\(format.pixelFormatName) bitDepth=\(format.bitDepth ?? -1) transfer=\(format.transferFunction ?? "nil") primaries=\(format.colorPrimaries ?? "nil") matrix=\(format.yCbCrMatrix ?? "nil") range=\(format.colorRange ?? "nil")"
+        )
+        colorState.detectedMode = format.mode
+        colorState.decodedChromaFormat = format.chromaFormat
+        colorState.fallbackReason = fallbackReason(for: format)
+    }
+
+    private func applyNegotiatedHDRMode(_ rawMode: Int) {
+        videoColorLog.info("negotiated gameSessionHdrMode=\(rawMode)")
+        if rawMode == 0 {
+            if colorState.requestedMode != .hdr10 {
+                colorState.negotiatedMode = colorState.requestedMode
+            } else if colorState.fallbackReason == nil {
+                colorState.fallbackReason = .serverReturnedSDR
+            }
+        } else {
+            colorState.negotiatedMode = .hdr10
+        }
+    }
+
+    private func fallbackReason(for format: DecodedVideoFormat) -> ColorFallbackReason? {
+        if format.decoderPath == .softwareI420 {
+            return .softwareDecoder
+        }
+        switch (colorState.requestedMode, format.mode) {
+        case (.hdr10, .sdr10), (.hdr10, .sdr8):
+            return .serverReturnedSDR
+        case (.sdr10, .sdr8):
+            return .decoderReturned8Bit
+        case (_, .unknown10Bit), (_, .unknown8Bit):
+            return .missingColorMetadata
+        default:
+            return nil
+        }
+    }
+
+    /// Logs one compact AudioSync line per stats tick (diagnostic mode only), interval-averaged
+    /// over the last tick like the video stats. Reading the line:
+    /// - neteq: actual/target/floor delay of WebRTC's adaptive audio jitter buffer. A raised
+    ///   floor (min) means something external — e.g. the lip-sync module — is holding audio back.
+    /// - device: playout delay after the jitter buffer (ADM + OS output buffers).
+    /// - stretch: NetEQ time-stretching (+slowed/−accelerated) and concealment, ms of audio.
+    /// - av-offset: video − audio estimated playout timestamps; positive = audio behind video.
+    private func applyAudioSyncStats(_ sample: AudioSyncStatsSnapshot) {
+        defer { previousAudioSyncStats = sample }
+        guard let previous = previousAudioSyncStats else { return }
+
+        let emitted = max(0, sample.jitterBufferEmittedCount - previous.jitterBufferEmittedCount)
+        let neteqMs = intervalAverage(sample.jitterBufferDelaySeconds, previous.jitterBufferDelaySeconds, count: emitted)
+        let targetMs = intervalAverage(sample.jitterBufferTargetDelaySeconds, previous.jitterBufferTargetDelaySeconds, count: emitted)
+        let minMs = intervalAverage(sample.jitterBufferMinimumDelaySeconds, previous.jitterBufferMinimumDelaySeconds, count: emitted)
+
+        let playoutSamples = max(0, sample.playoutSamplesCount - previous.playoutSamplesCount)
+        let deviceMs = intervalAverage(sample.totalPlayoutDelaySeconds, previous.totalPlayoutDelaySeconds, count: playoutSamples)
+
+        // NetEQ time-stretching over the interval, converted from samples to ms at 48 kHz
+        let sloweddMs = max(0, sample.insertedSamplesForDeceleration - previous.insertedSamplesForDeceleration) / 48
+        let acceleratedMs = max(0, sample.removedSamplesForAcceleration - previous.removedSamplesForAcceleration) / 48
+        let concealedMs = max(0, sample.concealedSamples - previous.concealedSamples) / 48
+
+        let avOffsetMs: Double? = if let audioTs = sample.audioPlayoutTimestampMs,
+                                     let videoTs = sample.videoPlayoutTimestampMs
+        {
+            videoTs - audioTs
+        } else {
+            nil
+        }
+
+        let lost = max(0, sample.packetsLost - previous.packetsLost)
+        // Live OS output latency: the media-playout stat can be absent depending on the active
+        // audio unit (then device reads 0), so also sample the route's latency directly.
+        let osOutputLatencyMs = AVAudioSession.sharedInstance().outputLatency * 1000
+        let microphoneSnapshot = GFNAudioDevice.shared.microphoneTelemetry.snapshot
+        let osInputLatencyMs = microphoneSnapshot.isCapturing
+            ? GFNAudioDevice.shared.inputLatency * 1000
+            : nil
+
+        updateAudioStats {
+            $0.jitterBufferCurrentMs = neteqMs
+            $0.jitterBufferTargetMs = targetMs
+            $0.devicePlayoutMs = deviceMs
+            $0.packetsLost = Int(lost)
+            $0.jitterMs = sample.jitterSeconds * 1000
+            $0.concealedMsPerSecond = concealedMs
+            $0.stretchedMsPerSecond = sloweddMs
+            $0.acceleratedMsPerSecond = acceleratedMs
+            $0.avOffsetMs = avOffsetMs
+            $0.inputLatencyMs = osInputLatencyMs
+            $0.outputLatencyMs = osOutputLatencyMs
+            $0.outputChannels = GFNAudioDevice.shared.outputNumberOfChannels
+            $0.outputSampleRateHz = GFNAudioDevice.shared.deviceOutputSampleRate
+            $0.outputRouteName = GFNAudioDevice.shared.outputRouteName
+        }
+
+        guard diagnosticsEnabled else { return }
+        let offset = avOffsetMs.map { String(format: "%+.0fms", $0) } ?? "n/a (no RTCP SR mapping)"
+        let message = String(
+            format: "neteq %.0fms (target %.0f, min %.0f) | device %.0fms out %.0fms | stretch +%.0f/-%.0fms conceal %.0fms | jitter %.1fms lost %.0f | av-offset %@",
+            neteqMs, targetMs, minMs, deviceMs, osOutputLatencyMs, sloweddMs, acceleratedMs, concealedMs,
+            sample.jitterSeconds * 1000, lost, offset
+        )
+        audioSyncLog.info("\(message, privacy: .public)")
+    }
+
+    private func intervalAverage(_ current: Double, _ previous: Double, count: Double) -> Double {
+        guard count > 0 else { return 0 }
+        return max(0, current - previous) / count * 1000
+    }
+
+    private func intervalCount(_ current: Double, _ previous: Double) -> Int {
+        Int(max(0, current - previous))
+    }
+
+    private func pruneRtcEventLogs(in directory: URL, keeping count: Int) throws {
+        let keys: Set<URLResourceKey> = [.contentModificationDateKey, .creationDateKey]
+        let logs = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles]
+        )
+        let sorted = logs.sorted { lhs, rhs in
+            let leftValues = try? lhs.resourceValues(forKeys: keys)
+            let rightValues = try? rhs.resourceValues(forKeys: keys)
+            let leftDate = leftValues?.contentModificationDate ?? leftValues?.creationDate ?? .distantPast
+            let rightDate = rightValues?.contentModificationDate ?? rightValues?.creationDate ?? .distantPast
+            return leftDate > rightDate
+        }
+        for url in sorted.dropFirst(max(0, count)) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private func parseSelectedConnectionStats(_ report: LKRTCStatisticsReport) {
+        let transport = report.statistics.values.first { $0.type == "transport" }
+        let selectedPairId = transport?.values["selectedCandidatePairId"] as? String
+        let succeededPairs = report.statistics.values.filter {
+            $0.type == "candidate-pair" && $0.values["state"] as? String == "succeeded"
+        }
+        let selectedPair = selectedPairId.flatMap { report.statistics[$0] }
+            ?? succeededPairs.first(where: { ($0.values["nominated"] as? NSNumber)?.boolValue == true })
+            ?? succeededPairs.first
+        guard let selectedPair else { return }
+
+        let localId = selectedPair.values["localCandidateId"] as? String
+        let remoteId = selectedPair.values["remoteCandidateId"] as? String
+        let local = localId.flatMap { report.statistics[$0] }
+        let remote = remoteId.flatMap { report.statistics[$0] }
+        let pairId = selectedPair.id
+        var next = stats
+
+        if !previousSelectedCandidatePairId.isEmpty, previousSelectedCandidatePairId != pairId {
+            next.candidatePairChanges += 1
+            let previousPairId = previousSelectedCandidatePairId
+            gfnLog.debug("[ICE] Selected pair changed: \(previousPairId, privacy: .private) -> \(pairId, privacy: .private)")
+        }
+        previousSelectedCandidatePairId = pairId
+
+        next.selectedCandidatePairId = pairId
+        next.rttMs = numericValue(selectedPair.values["currentRoundTripTime"]) * 1000
+        next.availableIncomingBitrateKbps = Int(
+            numericValue(selectedPair.values["availableIncomingBitrate"]) / 1000
+        )
+        let localProtocol = local?.values["protocol"] as? String ?? ""
+        let remoteProtocol = remote?.values["protocol"] as? String ?? ""
+        next.selectedProtocol = localProtocol.isEmpty ? remoteProtocol : localProtocol
+        next.localCandidateType = local?.values["candidateType"] as? String ?? ""
+        next.remoteCandidateType = remote?.values["candidateType"] as? String ?? ""
+        next.localCandidateAddress = candidateAddress(local)
+        next.remoteCandidateAddress = candidateAddress(remote)
+        let protocolName = next.selectedProtocol.lowercased()
+        let usesRelay = next.localCandidateType.lowercased() == "relay"
+            || next.remoteCandidateType.lowercased() == "relay"
+        if protocolName == "tcp" || protocolName == "tls" {
+            next.selectedNetworkPath = "tcp_tls_fallback"
+        } else if usesRelay, protocolName == "udp" {
+            next.selectedNetworkPath = "turn_udp_relay"
+        } else if protocolName == "udp" {
+            next.selectedNetworkPath = "direct_udp"
+        } else {
+            next.selectedNetworkPath = "unknown"
+        }
+        if next != stats {
+            stats = next
+        }
+
+        let now = Date()
+        if next.rttMs > 0,
+           lastZoneRttFeedbackAt.map({ now.timeIntervalSince($0) >= 30 }) ?? true,
+           let zoneUrl = sessionInfo?.zone,
+           !zoneUrl.isEmpty
+        {
+            lastZoneRttFeedbackAt = now
+            let rttMs = next.rttMs
+            Task { await ZoneClient.shared.recordSessionRtt(zoneUrl: zoneUrl, rttMs: rttMs) }
+        }
+    }
+
+    private func candidateAddress(_ candidate: LKRTCStatistics?) -> String {
+        guard let candidate else { return "" }
+        let address = candidate.values["address"] as? String
+            ?? candidate.values["ip"] as? String
+            ?? ""
+        let port = Int(numericValue(candidate.values["port"]))
+        return port > 0 ? "\(address):\(port)" : address
+    }
+
+    private func numericValue(_ value: Any?) -> Double {
+        (value as? NSNumber)?.doubleValue ?? 0
+    }
+}
+
+// MARK: - LKRTCPeerConnectionDelegate
+
+extension GFNStreamController: LKRTCPeerConnectionDelegate {
+    nonisolated func peerConnectionShouldNegotiate(_: LKRTCPeerConnection) {}
+
+    nonisolated func peerConnection(_: LKRTCPeerConnection, didChange stateChanged: LKRTCSignalingState) {
+        gfnLog.debug("[Stream] Signaling state → \(stateChanged.rawValue, privacy: .public)")
+    }
+
+    nonisolated func peerConnection(_: LKRTCPeerConnection, didAdd _: LKRTCMediaStream) {}
+
+    nonisolated func peerConnection(_: LKRTCPeerConnection, didRemove _: LKRTCMediaStream) {}
+
+    nonisolated func peerConnection(
+        _ sourcePeerConnection: LKRTCPeerConnection,
+        didChange newState: LKRTCIceConnectionState
+    ) {
+        let name = switch newState {
+        case .new: "new"
+        case .checking: "checking"
+        case .connected: "connected"
+        case .completed: "completed"
+        case .failed: "failed"
+        case .disconnected: "disconnected"
+        case .closed: "closed"
+        case .count: "count"
+        @unknown default: "unknown(\(newState.rawValue))"
+        }
+        gfnLog.debug("[ICE] State → \(name, privacy: .public)")
+        Task { @MainActor [weak self] in
+            guard let self, peerConnection === sourcePeerConnection else { return }
+            switch newState {
+            case .connected, .completed:
+                wasStreaming = true
+                reconnectAttempt = 0
+                state = .streaming
+                if streamingStartedAt == nil {
+                    let connectedAt = Date()
+                    streamingStartedAt = connectedAt
+                    let startedAt = sessionStartedAt ?? connectedAt
+                    sessionStartedAt = startedAt
+                    sessionCountdown = GFNSessionCountdown(
+                        membershipTier: membershipTier,
+                        startedAt: startedAt
+                    )
+                }
+                startStatsTimer()
+            case .disconnected:
+                stopStatsTimer()
+                if serverStopped {
+                    state = .sessionEnded
+                } else if wasStreaming {
+                    attemptReconnect()
+                } else {
+                    state = .disconnected(reason: "ICE disconnected")
+                }
+            case .failed:
+                stopStatsTimer()
+                if serverStopped {
+                    state = .sessionEnded
+                } else if wasStreaming {
+                    attemptReconnect()
+                } else {
+                    state = .failed(message: "ICE connection failed")
+                }
+            default:
+                break
+            }
+        }
+    }
+
+    nonisolated func peerConnection(_: LKRTCPeerConnection, didChange newState: LKRTCIceGatheringState) {
+        let name = switch newState {
+        case .new: "new"
+        case .gathering: "gathering"
+        case .complete: "complete"
+        @unknown default: "unknown(\(newState.rawValue))"
+        }
+        gfnLog.debug("[ICE] Gathering → \(name, privacy: .public)")
+    }
+
+    nonisolated func peerConnection(
+        _ sourcePeerConnection: LKRTCPeerConnection,
+        didGenerate candidate: LKRTCIceCandidate
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self, peerConnection === sourcePeerConnection else { return }
+            signaling?.sendICECandidate(
+                candidate: candidate.sdp,
+                sdpMid: candidate.sdpMid,
+                sdpMLineIndex: Int(candidate.sdpMLineIndex)
+            )
+        }
+    }
+
+    nonisolated func peerConnection(_: LKRTCPeerConnection, didRemove _: [LKRTCIceCandidate]) {}
+
+    nonisolated func peerConnection(
+        _ sourcePeerConnection: LKRTCPeerConnection,
+        didOpen dataChannel: LKRTCDataChannel
+    ) {
+        gfnLog.debug("[DataChannel] Server opened channel: label=\(dataChannel.label, privacy: .public)")
+        guard dataChannel.label == "control_channel",
+              registerControlChannel(dataChannel, for: sourcePeerConnection)
+        else { return }
+        dataChannel.delegate = self
+        Task { @MainActor [weak self] in
+            guard let self,
+                  peerConnection === sourcePeerConnection,
+                  isCurrentControlChannel(dataChannel)
+            else { return }
+            controlChannel = dataChannel
+        }
+    }
+
+    nonisolated func peerConnection(_ sourcePeerConnection: LKRTCPeerConnection,
+                                    didAdd rtpReceiver: LKRTCRtpReceiver,
+                                    streams _: [LKRTCMediaStream])
+    {
+        gfnLog.debug("[Stream] Received RTP receiver: kind=\(rtpReceiver.track?.kind ?? "nil", privacy: .public)")
+        guard let track = rtpReceiver.track as? LKRTCVideoTrack else { return }
+        gfnLog.info("[Stream] Got video track")
+        Task { @MainActor [weak self] in
+            guard let self, peerConnection === sourcePeerConnection else { return }
+            videoReceiver = rtpReceiver
+            videoTrack = track
+        }
+    }
+}
+
+// MARK: - LKRTCDataChannelDelegate
+
+extension GFNStreamController: LKRTCDataChannelDelegate {
+    nonisolated func dataChannelDidChangeState(_ dataChannel: LKRTCDataChannel) {
+        gfnLog.debug("[DataChannel] State → \(dataChannel.readyState.rawValue, privacy: .public) label=\(dataChannel.label, privacy: .public)")
+        if dataChannel.label == "input_channel_v1" {
+            let state = switch dataChannel.readyState {
+            case .connecting: "connecting"
+            case .open: "open"
+            case .closing: "closing"
+            case .closed: "closed"
+            @unknown default: "unknown"
+            }
+            inputSendQueue.async { [weak self] in
+                guard let self else { return }
+                let pending = inputSendState.withLock { inputState -> [PendingInputSend] in
+                    guard inputState.reliableChannel === dataChannel else { return [] }
+                    inputState.channelState = state
+                    inputState.bufferedBytes = dataChannel.bufferedAmount
+                    guard state == "closing" || state == "closed" else { return [] }
+                    let pending = Array(inputState.pendingGamepadSnapshots.values)
+                    inputState.pendingGamepadSnapshots.removeAll()
+                    inputState.dropped &+= UInt64(pending.count)
+                    return pending
+                }
+                pending.forEach { $0.completion(.channelUnavailable) }
+            }
+        }
+        // InputSender is NOT started here — it starts only after the server sends its
+        // handshake message on input_channel_v1 (handled in dataChannel(_:didReceiveMessageWith:))
+    }
+
+    nonisolated func dataChannel(_ dataChannel: LKRTCDataChannel, didChangeBufferedAmount amount: UInt64) {
+        guard dataChannel.label == "input_channel_v1" else { return }
+        inputSendQueue.async { [weak self] in
+            guard let self else { return }
+            let isCurrentChannel = inputSendState.withLock { state -> Bool in
+                guard state.reliableChannel === dataChannel else { return false }
+                state.bufferedBytes = amount
+                return true
+            }
+            guard isCurrentChannel else { return }
+            drainPendingGamepadSnapshotsIfPossible(on: dataChannel)
+        }
+    }
+
+    nonisolated func dataChannel(_ dataChannel: LKRTCDataChannel, didReceiveMessageWith buffer: LKRTCDataBuffer) {
+        if dataChannel.label == "stats_channel" {
+            if let gameFps = Self.parseStatsChannelGameFps(buffer.data) {
+                Task { @MainActor [weak self] in
+                    guard let self, statsChannel === dataChannel else { return }
+                    updateStats { $0.gameFps = gameFps }
+                }
+            }
+            return
+        }
+
+        // Handle control channel messages (timerNotification etc.)
+        if dataChannel.label == "control_channel" {
+            guard isCurrentControlChannel(dataChannel) else { return }
+            let text = String(data: buffer.data, encoding: .utf8) ?? "<binary \(buffer.data.count)B>"
+            gfnLog.debug("[ControlChannel] Message: \(text, privacy: .private)")
+
+            if let warning = StreamTimeWarning(
+                timerNotificationData: buffer.data
+            ) {
+                let receivedAt = Date()
+                Task { @MainActor [weak self] in
+                    guard let self, isCurrentControlChannel(dataChannel) else { return }
+                    timeWarning = warning
+                    if warning.reportsSessionLimit,
+                       let secondsLeft = warning.secondsLeft
+                    {
+                        sessionCountdown = sessionCountdown?
+                            .synchronized(
+                                secondsLeft: secondsLeft,
+                                receivedAt: receivedAt
+                            )
+                            ?? GFNSessionCountdown(
+                                secondsLeft: secondsLeft,
+                                receivedAt: receivedAt
+                            )
+                    }
+                }
+            }
+            if let json = try? JSONSerialization.jsonObject(with: buffer.data) as? [String: Any],
+               let hdrMode = json["gameSessionHdrMode"] as? [String: Any],
+               let rawMode = hdrMode["hdrMode"] as? Int
+            {
+                Task { @MainActor [weak self] in
+                    guard let self, isCurrentControlChannel(dataChannel) else { return }
+                    applyNegotiatedHDRMode(rawMode)
+                }
+            }
+            // The server sends an `exitMessage` when it deliberately ends the stream — the user
+            // closed the game, the session was stopped, a time limit was hit, or an idle kick.
+            // Mark it so the ICE disconnect that follows ends the session instead of triggering a
+            // pointless reconnect (the seat is being torn down; a reclaim would fail anyway).
+            if let json = try? JSONSerialization.jsonObject(with: buffer.data) as? [String: Any],
+               json["exitMessage"] != nil
+            {
+                gfnLog.info("control channel exitMessage received — server ended stream, not reconnecting")
+                Task { @MainActor [weak self] in
+                    guard let self, isCurrentControlChannel(dataChannel) else { return }
+                    serverStopped = true
+                    state = .sessionEnded
+                }
+            }
+            return
+        }
+
+        // Parse protocol version from the server's first handshake message on the input channel.
+        // firstWord==526 (0x020e) → version in bytes[2:3]; bytes[0]==0x0e → version==firstWord.
+        // Do NOT echo the handshake back — official GFN client doesn't.
+        let bytes = buffer.data
+        guard bytes.count >= 2 else { return }
+
+        let firstWord = UInt16(bytes[0]) | (UInt16(bytes[1]) << 8)
+        var version = 2
+
+        if firstWord == 526 {
+            version = bytes.count >= 4 ? Int(UInt16(bytes[2]) | (UInt16(bytes[3]) << 8)) : 2
+            gfnLog.debug("[DataChannel] Handshake: firstWord=526 (0x020e), version=\(version, privacy: .public)")
+        } else if bytes[0] == 0x0E {
+            version = Int(firstWord)
+            gfnLog.debug("[DataChannel] Handshake: byte[0]=0x0e, version=\(version, privacy: .public)")
+        } else {
+            if let cmd = GFNHapticsDecoder.decode(buffer.data) {
+                inputSendQueue.async { [weak self] in
+                    let sink = self?.inputSendState.withLock {
+                        state -> (@Sendable (Int, UInt16, UInt16) -> Void)? in
+                        guard state.reliableChannel === dataChannel else { return nil }
+                        return state.rumbleSink
+                    }
+                    sink?(cmd.controllerId, cmd.weak, cmd.strong)
+                }
+                return
+            }
+            gfnLog.debug("[DataChannel] Non-handshake message on \(dataChannel.label, privacy: .public): firstWord=\(firstWord, privacy: .public) (0x\(String(firstWord, radix: 16), privacy: .public))")
+            return
+        }
+
+        let negotiatedVersion = version
+        Task { @MainActor [weak self] in
+            guard let self,
+                  inputDataChannel === dataChannel,
+                  !inputReady
+            else { return }
+            inputReady = true
+            protocolVersion = negotiatedVersion
+            gfnLog.info("[DataChannel] Input ready — starting InputSender (protocol v\(negotiatedVersion, privacy: .public))")
+            let sender = InputSender(channel: self)
+            sender.configure(
+                protocolVersion: negotiatedVersion,
+                deadzone: Float(settings.controllerDeadzone),
+                overlayTriggerButton: settings.overlayTriggerButton,
+                textInputTriggerSequence: settings.textInputTriggerSequence,
+                textInputTriggerDelayMs: settings.textInputTriggerDelayMs,
+                keyboardLayout: settings.keyboardLayout,
+                steamOverlayGestureEnabled: settings.enableSteamOverlayGesture,
+                remoteMode: settings.defaultRemoteInputMode,
+                rumbleEnabled: settings.rumbleEnabled,
+                rumbleIntensity: Float(settings.rumbleIntensity),
+                sonyGamepadEnabled: GFNSonyGamepad.isSupported(
+                    protocolVersion: negotiatedVersion,
+                    gameSupportsDualShock: gameSupportsDualShock,
+                    serverHidMask: serverHidMask
+                )
+            )
+            remoteMode = settings.defaultRemoteInputMode
+            videoView?.gamepadModeActive = remoteMode != .gamepadMouse
+            sender.menuToggleHandler = { [weak self, weak sender] in
+                guard let self, inputSender === sender else { return }
+                handleMenuPress()
+            }
+            sender.onRemoteModeChanged = { [weak self, weak sender] mode in
+                guard let self, inputSender === sender else { return }
+                remoteMode = mode
+                videoView?.gamepadModeActive = mode != .gamepadMouse
+            }
+            sender.controllerKeyboardShortcutHandler = { [weak self, weak sender] in
+                guard let self, let sender, inputSender === sender else { return }
+                beginControllerTextEntry()
+            }
+            sender.start()
+            if let previousInputSender = inputSender, previousInputSender !== sender {
+                invalidateControllerTextEntryReplay()
+                previousInputSender.stop()
+            }
+            inputSender = sender
+            inputSendQueue.async { [weak self, sender] in
+                self?.inputSendState.withLock { state in
+                    guard state.reliableChannel === dataChannel else { return }
+                    state.rumbleSink = { controllerId, weak, strong in
+                        sender.applyRumble(controllerId: controllerId, weak: weak, strong: strong)
+                    }
+                }
+            }
+            // Forward keyboard/mouse events from the video surface to the sender
+            videoView?.inputHandler = sender
+            syncInputPauseState()
+        }
+    }
+}
+
+private extension GFNStreamController {
+    func rejectControllerTextEntryReplay(_ token: ControllerTextEntryReplayToken) {
+        guard controllerTextEntryReplayLifecycle.rejectReplay(token) else { return }
+        if pendingControllerTextEntryReplay?.token == token {
+            pendingControllerTextEntryReplay = nil
+        }
+    }
+
+    func finishControllerTextEntryReplay(
+        _ token: ControllerTextEntryReplayToken,
+        result: ControllerTextEntrySubmissionResult
+    ) {
+        guard controllerTextEntryReplayLifecycle.finishReplay(token),
+              let pendingReplay = pendingControllerTextEntryReplay,
+              pendingReplay.token == token
+        else { return }
+
+        pendingControllerTextEntryReplay = nil
+        syncInputPauseState()
+        pendingReplay.completion(result)
+    }
+
+    func invalidateControllerTextEntryReplay() {
+        controllerTextEntryReplayLifecycle.invalidate()
+        let pendingReplay = pendingControllerTextEntryReplay
+        pendingControllerTextEntryReplay = nil
+        syncInputPauseState()
+        pendingReplay?.completion(.sendFailed)
+    }
+
+    func syncInputPauseState() {
+        inputSender?.setPaused(
+            controllerTextEntryReplayLifecycle.inputPaused(overlayPaused: overlayInputPaused)
+        )
+    }
+}
+
+// MARK: - DataChannelSender conformance
+
+extension GFNStreamController: DataChannelSender {
+    nonisolated func sendData(
+        _ packet: EncodedInputPacket,
+        completion: @escaping @Sendable (InputSendDisposition) -> Void
+    ) {
+        inputSendQueue.async { [weak self] in
+            guard let self else {
+                completion(.channelUnavailable)
+                return
+            }
+            let completed = inputSendState.withLock { state -> [CompletedInputSend] in
+                state.generated &+= 1
+                guard let dataChannel = state.reliableChannel,
+                      dataChannel.readyState == .open
+                else {
+                    state.dropped &+= 1
+                    return [CompletedInputSend(completion: completion, disposition: .channelUnavailable)]
+                }
+
+                var completed: [CompletedInputSend] = []
+                if let slot = packet.gamepadSlot {
+                    if let pending = state.pendingGamepadSnapshots.removeValue(forKey: slot) {
+                        state.superseded &+= 1
+                        completed.append(
+                            CompletedInputSend(completion: pending.completion, disposition: .superseded)
+                        )
+                    }
+                    if packet.isReplaceableGamepadSnapshot,
+                       dataChannel.bufferedAmount > self.inputBackpressureHighWaterBytes
+                    {
+                        state.pendingGamepadSnapshots[slot] = (packet, completion)
+                        return completed
+                    }
+                }
+
+                completed.append(
+                    CompletedInputSend(
+                        completion: completion,
+                        disposition: self.sendImmediately(packet, on: dataChannel, state: &state)
+                    )
+                )
+                completed.append(
+                    contentsOf: self.drainPendingGamepadSnapshotsIfPossible(
+                        on: dataChannel,
+                        state: &state
+                    )
+                )
+                return completed
+            }
+            completed.forEach { $0.completion($0.disposition) }
+        }
+    }
+
+    private nonisolated func sendImmediately(
+        _ packet: EncodedInputPacket,
+        on dataChannel: LKRTCDataChannel,
+        state: inout InputSendState
+    ) -> InputSendDisposition {
+        let waitNs = DispatchTime.now().uptimeNanoseconds &- packet.generatedAt
+        if state.latencySamplingEnabled {
+            state.queueWaitsNs.append(waitNs)
+            state.queueMaxNs = max(state.queueMaxNs, waitNs)
+        }
+        if packet.category == .gamepadSnapshot {
+            state.newestGamepadGeneratedAt = packet.generatedAt
+        }
+        let data = Data(
+            bytesNoCopy: packet.storage.mutableBytes,
+            count: packet.count,
+            deallocator: .none
+        )
+        let buffer = LKRTCDataBuffer(data: data, isBinary: true)
+        state.submitted &+= 1
+        var accepted = dataChannel.sendData(buffer)
+        if !accepted, dataChannel.readyState == .open {
+            // One immediate retry preserves FIFO ordering without creating an application retry queue.
+            state.submitted &+= 1
+            accepted = dataChannel.sendData(buffer)
+        }
+        state.bufferedBytes = dataChannel.bufferedAmount
+        if accepted {
+            state.accepted &+= 1
+            return .accepted
+        } else {
+            state.dropped &+= 1
+            return .rejected
+        }
+    }
+
+    private nonisolated func drainPendingGamepadSnapshotsIfPossible(on dataChannel: LKRTCDataChannel) {
+        let completed = inputSendState.withLock { state in
+            drainPendingGamepadSnapshotsIfPossible(on: dataChannel, state: &state)
+        }
+        completed.forEach { $0.completion($0.disposition) }
+    }
+
+    private nonisolated func drainPendingGamepadSnapshotsIfPossible(
+        on dataChannel: LKRTCDataChannel,
+        state: inout InputSendState
+    ) -> [CompletedInputSend] {
+        guard dataChannel.readyState == .open,
+              dataChannel.bufferedAmount <= inputBackpressureLowWaterBytes else { return [] }
+        var completed: [CompletedInputSend] = []
+        for slot in state.pendingGamepadSnapshots.keys.sorted() {
+            guard dataChannel.bufferedAmount <= inputBackpressureHighWaterBytes,
+                  let pending = state.pendingGamepadSnapshots.removeValue(forKey: slot) else { break }
+            completed.append(
+                CompletedInputSend(
+                    completion: pending.completion,
+                    disposition: sendImmediately(pending.packet, on: dataChannel, state: &state)
+                )
+            )
+        }
+        return completed
+    }
+}
+
+// MARK: - Errors
+
+enum StreamError: Error {
+    case noSDP
+}

@@ -1,0 +1,268 @@
+import SwiftUI
+
+struct HomeView: View {
+    let onPlay: (GameInfo) -> Void
+    let onResume: (ResumableSession) -> Void
+
+    @Environment(GamesViewModel.self) var viewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var carouselRequest: CarouselRequest?
+    @State private var carouselSourceFocus: HomeGameFocus?
+    @State private var restoreScrollTarget: HomeGameFocus?
+    @FocusState private var focusedGame: HomeGameFocus?
+
+    var body: some View {
+        ZStack {
+            if viewModel.isLoading {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Color.gray.opacity(0.2)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 420)
+                            .clipShape(RoundedRectangle(cornerRadius: 20))
+                            .shimmer()
+                            .padding(.horizontal, 60)
+                        VStack(alignment: .leading, spacing: 48) {
+                            skeletonRow
+                            skeletonRow
+                        }
+                        .padding(.top, 48)
+                        .padding(.bottom, 60)
+                    }
+                }
+            } else if viewModel.continuePlaying.isEmpty, viewModel.recentlyPlayedGames.isEmpty, viewModel.favoriteGames.isEmpty, activeResumable == nil {
+                emptyState
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 0) {
+                            let heroGame: GameInfo? = activeResumable == nil
+                                ? (viewModel.continuePlaying.first ?? viewModel.recentlyPlayedGames.first ?? viewModel.favoriteGames.first)
+                                : nil
+                            if let rs = activeResumable {
+                                resumeBanner(rs)
+                            } else if let hero = heroGame {
+                                heroBanner(hero)
+                            }
+
+                            VStack(alignment: .leading, spacing: 48) {
+                                if !viewModel.continuePlaying.isEmpty {
+                                    gameRow(
+                                        row: .continuePlaying,
+                                        title: L10n.text("resume_stream"),
+                                        games: viewModel.continuePlaying,
+                                        badge: L10n.text("live")
+                                    )
+                                }
+                                let recentWithoutHero = viewModel.recentlyPlayedGames.filter { $0.id != heroGame?.id }
+                                if !recentWithoutHero.isEmpty {
+                                    gameRow(
+                                        row: .recent,
+                                        title: L10n.text("recently_played"),
+                                        games: recentWithoutHero
+                                    )
+                                }
+                                if !viewModel.favoriteGames.isEmpty {
+                                    gameRow(
+                                        row: .favorites,
+                                        title: L10n.text("favorites"),
+                                        games: viewModel.favoriteGames,
+                                        isFavoritesRow: true
+                                    )
+                                }
+                            }
+                            .padding(.top, 48)
+                            .padding(.bottom, 60)
+                        }
+                    }
+                    .onChange(of: restoreScrollTarget) { _, newValue in
+                        guard let newValue else { return }
+                        if reduceMotion {
+                            proxy.scrollTo(newValue, anchor: .center)
+                        } else {
+                            withAnimation {
+                                proxy.scrollTo(newValue, anchor: .center)
+                            }
+                        }
+                        restoreScrollTarget = nil
+                    }
+                }
+            }
+        }
+        .fullScreenCover(item: $carouselRequest) { req in
+            GameCarouselView(request: req, onPlay: onPlay, onDismiss: { lastId in
+                carouselRequest = nil
+                let source = carouselSourceFocus
+                carouselSourceFocus = nil
+                guard let lastId, let source else { return }
+                let target = HomeGameFocus(row: source.row, gameId: lastId)
+                restoreScrollTarget = target
+                Task { @MainActor in
+                    await Task.yield()
+                    focusedGame = target
+                }
+            })
+            .environment(viewModel)
+        }
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: carouselRequest?.id)
+        .toolbar(.hidden, for: .navigationBar)
+        .task(id: viewModel.resumableSession?.expiryIdentity) {
+            guard let resumableSession = viewModel.resumableSession else { return }
+            let remaining = max(
+                ResumableSession.gracePeriod
+                    - Date().timeIntervalSince(resumableSession.leftAt),
+                0
+            )
+            do {
+                try await Task.sleep(for: .seconds(remaining))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  viewModel.resumableSession?.session.sessionId
+                  == resumableSession.session.sessionId,
+                  viewModel.resumableSession?.isExpired == true
+            else {
+                return
+            }
+            viewModel.resumableSession = nil
+        }
+    }
+
+    private var activeResumable: ResumableSession? {
+        guard let rs = viewModel.resumableSession, !rs.isExpired else { return nil }
+        return rs
+    }
+
+    // MARK: Resume Banner
+
+    private func resumeBanner(_ rs: ResumableSession) -> some View {
+        CloudResumableSessionBanner(
+            title: rs.game.title,
+            artworkURL: rs.game.heroBannerUrl,
+            expiresAt: rs.leftAt.addingTimeInterval(
+                ResumableSession.gracePeriod
+            ),
+            onResume: { onResume(rs) }
+        )
+    }
+
+    // MARK: Hero Banner
+
+    private func heroBanner(_ game: GameInfo) -> some View {
+        HeroBannerView(game: game, onPlay: onPlay)
+    }
+
+    // MARK: Game Row
+
+    private func gameRow(
+        row: HomeGameRow,
+        title: String,
+        games: [GameInfo],
+        badge: String? = nil,
+        isFavoritesRow: Bool = false
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack(spacing: 10) {
+                Text(title)
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(.white)
+                if let badge {
+                    Text(badge)
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.green, in: Capsule())
+                }
+            }
+            .padding(.horizontal, 60)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 24) {
+                    ForEach(games) { game in
+                        let focus = HomeGameFocus(row: row, gameId: game.id)
+                        GameCardView(game: game) { onPlay(game) }
+                            .frame(width: 200)
+                            .id(focus)
+                            .focused($focusedGame, equals: focus)
+                            .contextMenu {
+                                Button {
+                                    carouselSourceFocus = focus
+                                    carouselRequest = CarouselRequest(games: games, startId: game.id)
+                                } label: {
+                                    Label("Info", systemImage: "info.circle")
+                                }
+                                if isFavoritesRow {
+                                    Button {
+                                        viewModel.toggleFavorite(game.id)
+                                    } label: {
+                                        Label(L10n.text("remove_from_favorites"), systemImage: "star.slash.fill")
+                                    }
+                                }
+                            }
+                    }
+                }
+                .padding(.horizontal, 60)
+                .padding(.vertical, 20)
+            }
+            .focusSection()
+            .scrollClipDisabled()
+        }
+    }
+
+    private enum HomeGameRow: Hashable {
+        case continuePlaying
+        case recent
+        case favorites
+    }
+
+    private struct HomeGameFocus: Hashable {
+        let row: HomeGameRow
+        let gameId: String
+    }
+
+    // MARK: Skeleton Row
+
+    private var skeletonRow: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color.gray.opacity(0.25))
+                .frame(width: 180, height: 24)
+                .shimmer()
+                .padding(.horizontal, 60)
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 24) {
+                    ForEach(0 ..< 6, id: \.self) { _ in
+                        GameCardSkeleton().frame(width: 200)
+                    }
+                }
+                .padding(.horizontal, 60)
+            }
+            .allowsHitTesting(false)
+        }
+    }
+
+    // MARK: Empty State
+
+    private var emptyState: some View {
+        CloudCatalogHomeEmptyState()
+    }
+}
+
+// MARK: - Hero Banner View
+
+private struct HeroBannerView: View {
+    let game: GameInfo
+    let onPlay: (GameInfo) -> Void
+
+    var body: some View {
+        CloudCatalogHeroBanner(
+            artworkURL: game.heroBannerUrl,
+            prefetchArtworkURL: game.heroImageUrl ?? game.heroBannerUrl,
+            actionTitle: L10n.text("play"),
+            actionSystemImage: "play.fill",
+            action: { onPlay(game) }
+        )
+    }
+}

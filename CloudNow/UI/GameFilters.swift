@@ -1,0 +1,1033 @@
+import SwiftUI
+
+enum GameFilterContext: Equatable {
+    case store
+    case library
+}
+
+private extension GamePlayType {
+    var filterLabel: String? {
+        switch self {
+        case .readyToPlay: L10n.text("ready_to_play")
+        case .installToPlay: L10n.text("install_to_play")
+        case .unknown: nil
+        }
+    }
+}
+
+enum GameCollectionFilter: String, CaseIterable, Hashable, Identifiable {
+    case library
+    case favorites
+
+    var id: String {
+        rawValue
+    }
+
+    var label: String {
+        switch self {
+        case .library: L10n.text("my_library")
+        case .favorites: L10n.text("favorites")
+        }
+    }
+}
+
+struct GameFilterState: Equatable {
+    var collections: Set<GameCollectionFilter> = []
+    var genres: Set<String> = []
+    var stores: Set<String> = []
+    var subscriptions: Set<GameSubscription> = []
+    var playTypes: Set<GamePlayType> = []
+    var features: Set<GameFeature> = []
+
+    var activeSelectionCount: Int {
+        collections.count + genres.count + stores.count + subscriptions.count + playTypes.count + features.count
+    }
+
+    var isEmpty: Bool {
+        activeSelectionCount == 0
+    }
+
+    mutating func clear() {
+        collections.removeAll()
+        genres.removeAll()
+        stores.removeAll()
+        subscriptions.removeAll()
+        playTypes.removeAll()
+        features.removeAll()
+    }
+}
+
+struct GameFilterValueOption: Identifiable, Equatable {
+    let id: String
+    let label: String
+    let count: Int
+}
+
+struct GameFilterOptions: Equatable {
+    let genres: [GameFilterValueOption]
+    let stores: [GameFilterValueOption]
+    let subscriptions: [GameFilterValueOption]
+    let playTypes: [GameFilterValueOption]
+    let features: [GameFilterValueOption]
+    let libraryCount: Int
+    let favoriteCount: Int
+
+    init(games: [GameInfo], favoriteIds: Set<String>, context: GameFilterContext) {
+        var genreCounts: [String: Int] = [:]
+        var storeCounts: [String: Int] = [:]
+        var subscriptionCounts: [GameSubscription: Int] = [:]
+        var playTypeCounts: [GamePlayType: Int] = [:]
+        var featureCounts: [GameFeature: Int] = [:]
+
+        for game in games {
+            for genre in Set(game.genreCodes) {
+                genreCounts[genre, default: 0] += 1
+            }
+
+            let variants: [GameVariant] = switch context {
+            case .store:
+                game.variants
+            case .library:
+                game.variants.filter(\.isOwned)
+            }
+            let storesForGame = Set(variants.map { GameStoreFilter.normalizedCode($0.appStore) })
+            for code in storesForGame {
+                if GameStoreFilter.isDisplayable(code) {
+                    storeCounts[code, default: 0] += 1
+                }
+            }
+
+            for subscription in Set(variants.flatMap { $0.subscriptions ?? [] }) {
+                subscriptionCounts[subscription, default: 0] += 1
+            }
+
+            if let playType = game.playType, playType != .unknown {
+                playTypeCounts[playType, default: 0] += 1
+            }
+
+            for feature in Set(game.supportedFeatures ?? []) {
+                featureCounts[feature, default: 0] += 1
+            }
+        }
+
+        genres = genreCounts.map { code, count in
+            GameFilterValueOption(id: code, label: GameInfo.genreLabel(code), count: count)
+        }.sorted { $0.label.localizedStandardCompare($1.label) == .orderedAscending }
+
+        stores = storeCounts.map { store, count in
+            GameFilterValueOption(id: store, label: L10n.storeName(for: store), count: count)
+        }.sorted { $0.label.localizedStandardCompare($1.label) == .orderedAscending }
+
+        subscriptions = GameSubscription.allCases.compactMap { subscription in
+            guard let count = subscriptionCounts[subscription], count > 0 else { return nil }
+            return GameFilterValueOption(id: subscription.rawValue, label: subscription.label, count: count)
+        }
+
+        playTypes = GamePlayType.allCases.compactMap { playType in
+            guard let label = playType.filterLabel,
+                  let count = playTypeCounts[playType], count > 0
+            else { return nil }
+            return GameFilterValueOption(id: playType.rawValue, label: label, count: count)
+        }
+
+        features = GameFeature.allCases.compactMap { feature in
+            guard let count = featureCounts[feature], count > 0 else { return nil }
+            return GameFilterValueOption(id: feature.rawValue, label: feature.label, count: count)
+        }
+
+        libraryCount = games.count(where: \.isInLibrary)
+        favoriteCount = games.count { favoriteIds.contains($0.id) }
+    }
+}
+
+enum GameFilterEngine {
+    static func apply(
+        to games: [GameInfo],
+        context: GameFilterContext,
+        state: GameFilterState,
+        searchText: String,
+        sortOrder: LibrarySortOrder,
+        favoriteIds: Set<String>,
+        recentlyPlayedIds: [String]
+    ) -> [GameInfo] {
+        let search = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var result = games.filter { game in
+            matches(
+                game,
+                context: context,
+                state: state,
+                search: search,
+                favoriteIds: favoriteIds
+            )
+        }
+
+        switch sortOrder {
+        case .default:
+            break
+        case .titleAZ:
+            result.sort { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+        case .titleZA:
+            result.sort { $0.title.localizedStandardCompare($1.title) == .orderedDescending }
+        case .recentFirst:
+            var recentRank: [String: Int] = [:]
+            for (index, id) in recentlyPlayedIds.enumerated() where recentRank[id] == nil {
+                recentRank[id] = index
+            }
+            result.sort { lhs, rhs in
+                let leftRank = recentRank[lhs.id] ?? Int.max
+                let rightRank = recentRank[rhs.id] ?? Int.max
+                if leftRank != rightRank {
+                    return leftRank < rightRank
+                }
+                return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
+            }
+        }
+
+        return result
+    }
+
+    static func count(
+        in games: [GameInfo],
+        context: GameFilterContext,
+        state: GameFilterState,
+        searchText: String,
+        favoriteIds: Set<String>
+    ) -> Int {
+        let search = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return games.count { game in
+            matches(
+                game,
+                context: context,
+                state: state,
+                search: search,
+                favoriteIds: favoriteIds
+            )
+        }
+    }
+
+    private static func matches(
+        _ game: GameInfo,
+        context: GameFilterContext,
+        state: GameFilterState,
+        search: String,
+        favoriteIds: Set<String>
+    ) -> Bool {
+        if !search.isEmpty,
+           !game.title.localizedCaseInsensitiveContains(search)
+        {
+            return false
+        }
+
+        if !state.collections.isEmpty {
+            let matchesCollection =
+                (state.collections.contains(.library) && game.isInLibrary)
+                    || (state.collections.contains(.favorites) && favoriteIds.contains(game.id))
+            if !matchesCollection {
+                return false
+            }
+        }
+
+        if !state.genres.isEmpty,
+           state.genres.isDisjoint(with: game.genreCodes)
+        {
+            return false
+        }
+
+        if !state.stores.isEmpty || !state.subscriptions.isEmpty {
+            let matchesVariant = game.variants.contains { variant in
+                (context == .store || variant.isOwned)
+                    && (state.stores.isEmpty
+                        || state.stores.contains(GameStoreFilter.normalizedCode(variant.appStore)))
+                    && (state.subscriptions.isEmpty
+                        || !state.subscriptions.isDisjoint(with: variant.subscriptions ?? []))
+            }
+            if !matchesVariant {
+                return false
+            }
+        }
+
+        if !state.features.isEmpty,
+           state.features.isDisjoint(with: game.supportedFeatures ?? [])
+        {
+            return false
+        }
+
+        if !state.playTypes.isEmpty {
+            guard let playType = game.playType,
+                  playType != .unknown,
+                  state.playTypes.contains(playType)
+            else { return false }
+        }
+
+        return true
+    }
+}
+
+enum GameStoreFilter {
+    private nonisolated static let internalCodes: Set<String> = ["", "UNKNOWN", "NONE", "GFN", "NVIDIA", "NV_BUNDLE"]
+
+    nonisolated static func normalizedCode(_ value: String) -> String {
+        let code = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+            .split { !$0.isLetter && !$0.isNumber }
+            .joined(separator: "_")
+
+        return switch code {
+        case "EPIC", "EPIC_GAMES": "EPIC_GAMES_STORE"
+        case "ORIGIN", "EA": "EA_APP"
+        case "UBISOFT_CONNECT", "UPLAY": "UBISOFT"
+        case "MICROSOFT": "XBOX"
+        case "BATTLE_NET": "BATTLENET"
+        default: code
+        }
+    }
+
+    nonisolated static func isDisplayable(_ code: String) -> Bool {
+        !internalCodes.contains(code)
+    }
+}
+
+struct CloudCatalogSortOption<Value: Hashable>: Identifiable {
+    let value: Value
+    let label: String
+
+    var id: Value {
+        value
+    }
+}
+
+struct CloudCatalogActiveFilter: Identifiable {
+    let id: String
+    let label: String
+    let onRemove: () -> Void
+}
+
+/// Provider-neutral CloudNow catalog controls. Providers retain their own
+/// filter semantics while sharing the exact result, chip, sort, and filter UI.
+struct CloudCatalogFilterBar<SortValue: Hashable, FilterSheet: View>: View {
+    let totalCount: Int
+    let resultCount: Int
+    let sortOptions: [CloudCatalogSortOption<SortValue>]
+    let activeFilters: [CloudCatalogActiveFilter]
+    let activeSelectionCount: Int
+    let refreshTitle: String?
+    let isRefreshDisabled: Bool
+    let refreshAccessibilityIdentifier: String?
+    @Binding var sortOrder: SortValue
+
+    private let onRefresh: (() -> Void)?
+    private let filterSheet: (Binding<Bool>) -> FilterSheet
+    @State private var isShowingFilters = false
+
+    init(
+        totalCount: Int,
+        resultCount: Int,
+        sortOptions: [CloudCatalogSortOption<SortValue>],
+        activeFilters: [CloudCatalogActiveFilter],
+        activeSelectionCount: Int,
+        sortOrder: Binding<SortValue>,
+        refreshTitle: String? = nil,
+        isRefreshDisabled: Bool = false,
+        refreshAccessibilityIdentifier: String? = nil,
+        onRefresh: (() -> Void)? = nil,
+        @ViewBuilder filterSheet: @escaping (Binding<Bool>) -> FilterSheet
+    ) {
+        self.totalCount = totalCount
+        self.resultCount = resultCount
+        self.sortOptions = sortOptions
+        self.activeFilters = activeFilters
+        self.activeSelectionCount = activeSelectionCount
+        self.refreshTitle = refreshTitle
+        self.isRefreshDisabled = isRefreshDisabled
+        self.refreshAccessibilityIdentifier = refreshAccessibilityIdentifier
+        _sortOrder = sortOrder
+        self.onRefresh = onRefresh
+        self.filterSheet = filterSheet
+    }
+
+    var body: some View {
+        HStack(spacing: 20) {
+            Text(L10n.format("games_result_count", resultCount, totalCount))
+                .font(.headline.monospacedDigit())
+                .foregroundStyle(.primary)
+                .fixedSize()
+                .accessibilityIdentifier("catalog-result-count")
+
+            if !activeFilters.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        ForEach(activeFilters) { filter in
+                            ActiveFilterChip(
+                                label: filter.label,
+                                onRemove: filter.onRemove
+                            )
+                        }
+                    }
+                }
+                .scrollClipDisabled()
+            }
+
+            Spacer(minLength: 12)
+
+            Menu {
+                Picker(L10n.text("sort"), selection: $sortOrder) {
+                    ForEach(sortOptions) { option in
+                        Text(option.label).tag(option.value)
+                    }
+                }
+            } label: {
+                Label(selectedSortLabel, systemImage: "line.3.horizontal.decrease")
+            }
+            .buttonStyle(.bordered)
+            .accessibilityIdentifier("catalog-sort-menu")
+
+            Button {
+                isShowingFilters = true
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "line.3.horizontal.decrease.circle")
+                    Text(L10n.text("filters"))
+                    if activeSelectionCount > 0 {
+                        Text("\(activeSelectionCount)")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(.green, in: Capsule())
+                    }
+                }
+            }
+            .buttonStyle(.bordered)
+            .accessibilityIdentifier("catalog-filter-button")
+
+            if let refreshTitle, let onRefresh {
+                Button(action: onRefresh) {
+                    Label(refreshTitle, systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .disabled(isRefreshDisabled)
+                .accessibilityIdentifier(
+                    refreshAccessibilityIdentifier
+                        ?? "catalog-refresh-button"
+                )
+            }
+        }
+        .padding(.horizontal, 60)
+        .padding(.vertical, 22)
+        .focusSection()
+        .fullScreenCover(isPresented: $isShowingFilters) {
+            filterSheet($isShowingFilters)
+        }
+    }
+
+    private var selectedSortLabel: String {
+        sortOptions.first { $0.value == sortOrder }?.label
+            ?? sortOptions.first?.label
+            ?? L10n.text("sort")
+    }
+}
+
+struct GameFilterBar: View {
+    let totalCount: Int
+    let resultCount: Int
+    let context: GameFilterContext
+    let options: GameFilterOptions
+    let availableSortOrders: [LibrarySortOrder]
+    let previewBaseCount: Int
+    let previewCount: (GameFilterState) -> Int
+
+    @Binding var filterState: GameFilterState
+    @Binding var sortOrder: LibrarySortOrder
+
+    var body: some View {
+        CloudCatalogFilterBar(
+            totalCount: totalCount,
+            resultCount: resultCount,
+            sortOptions: availableSortOrders.map {
+                CloudCatalogSortOption(value: $0, label: $0.label)
+            },
+            activeFilters: activeChips,
+            activeSelectionCount: filterState.activeSelectionCount,
+            sortOrder: $sortOrder
+        ) { isPresented in
+            GameFilterSheet(
+                state: $filterState,
+                context: context,
+                options: options,
+                totalCount: previewBaseCount,
+                previewCount: previewCount,
+                onClose: { isPresented.wrappedValue = false }
+            )
+        }
+    }
+
+    private var activeChips: [CloudCatalogActiveFilter] {
+        var chips: [CloudCatalogActiveFilter] = []
+
+        for collection in filterState.collections.sorted(by: { $0.rawValue < $1.rawValue }) {
+            chips.append(CloudCatalogActiveFilter(id: "collection-\(collection.rawValue)", label: collection.label) {
+                filterState.collections.remove(collection)
+            })
+        }
+        for genre in filterState.genres.sorted(by: {
+            GameInfo.genreLabel($0).localizedStandardCompare(GameInfo.genreLabel($1)) == .orderedAscending
+        }) {
+            chips.append(CloudCatalogActiveFilter(id: "genre-\(genre)", label: GameInfo.genreLabel(genre)) {
+                filterState.genres.remove(genre)
+            })
+        }
+        for store in filterState.stores.sorted() {
+            chips.append(CloudCatalogActiveFilter(id: "store-\(store)", label: L10n.storeName(for: store)) {
+                filterState.stores.remove(store)
+            })
+        }
+        for subscription in GameSubscription.allCases where filterState.subscriptions.contains(subscription) {
+            chips.append(CloudCatalogActiveFilter(id: "subscription-\(subscription.rawValue)", label: subscription.label) {
+                filterState.subscriptions.remove(subscription)
+            })
+        }
+        for playType in GamePlayType.allCases where filterState.playTypes.contains(playType) {
+            if let label = playType.filterLabel {
+                chips.append(CloudCatalogActiveFilter(id: "play-type-\(playType.rawValue)", label: label) {
+                    filterState.playTypes.remove(playType)
+                })
+            }
+        }
+        for feature in filterState.features.sorted(by: { $0.rawValue < $1.rawValue }) {
+            chips.append(CloudCatalogActiveFilter(id: "feature-\(feature.rawValue)", label: feature.label) {
+                filterState.features.remove(feature)
+            })
+        }
+        return chips
+    }
+}
+
+private struct ActiveFilterChip: View {
+    let label: String
+    let onRemove: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: onRemove) {
+            HStack(spacing: 7) {
+                Text(label)
+                    .lineLimit(1)
+                Image(systemName: "xmark")
+                    .font(.caption2.weight(.bold))
+            }
+            .font(.callout.weight(.semibold))
+            .foregroundStyle(Color.black.opacity(0.84))
+            .padding(.horizontal, 16)
+            .padding(.vertical, 9)
+            .background(Color.green, in: Capsule())
+            .overlay {
+                Capsule()
+                    .stroke(isFocused ? Color.white : Color.clear, lineWidth: 3)
+            }
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .focused($isFocused)
+        .scaleEffect(isFocused ? 1.07 : 1)
+        .shadow(color: isFocused ? Color.white.opacity(0.25) : .clear, radius: 12)
+        .animation(.easeOut(duration: 0.16), value: isFocused)
+    }
+}
+
+private enum GameFilterSection: String, Hashable {
+    case collections
+    case genres
+    case stores
+    case subscriptions
+    case playTypes
+    case features
+}
+
+struct WrappingFilterLayout: Layout {
+    let horizontalSpacing: CGFloat
+    let verticalSpacing: CGFloat
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache _: inout ()
+    ) -> CGSize {
+        let proposedWidth = proposal.width ?? .greatestFiniteMagnitude
+        let result = arrangement(width: proposedWidth, subviews: subviews)
+        return CGSize(
+            width: proposal.width ?? result.contentWidth,
+            height: result.height
+        )
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal _: ProposedViewSize,
+        subviews: Subviews,
+        cache _: inout ()
+    ) {
+        let result = arrangement(width: bounds.width, subviews: subviews)
+        for index in subviews.indices {
+            let size = result.sizes[index]
+            let position = result.positions[index]
+            subviews[index].place(
+                at: CGPoint(x: bounds.minX + position.x, y: bounds.minY + position.y),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(width: size.width, height: size.height)
+            )
+        }
+    }
+
+    private func arrangement(width: CGFloat, subviews: Subviews) -> Arrangement {
+        let availableWidth = width.isFinite ? max(width, 0) : .greatestFiniteMagnitude
+        let sizes = subviews.map { $0.sizeThatFits(.unspecified) }
+        var positions: [CGPoint] = []
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        var contentWidth: CGFloat = 0
+
+        for size in sizes {
+            if x > 0, x + size.width > availableWidth {
+                x = 0
+                y += rowHeight + verticalSpacing
+                rowHeight = 0
+            }
+
+            positions.append(CGPoint(x: x, y: y))
+            contentWidth = max(contentWidth, x + size.width)
+            x += size.width + horizontalSpacing
+            rowHeight = max(rowHeight, size.height)
+        }
+
+        return Arrangement(
+            sizes: sizes,
+            positions: positions,
+            contentWidth: contentWidth,
+            height: sizes.isEmpty ? 0 : y + rowHeight
+        )
+    }
+
+    private struct Arrangement {
+        let sizes: [CGSize]
+        let positions: [CGPoint]
+        let contentWidth: CGFloat
+        let height: CGFloat
+    }
+}
+
+private struct GameFilterSheet: View {
+    @Binding var state: GameFilterState
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    let context: GameFilterContext
+    let options: GameFilterOptions
+    let totalCount: Int
+    let previewCount: (GameFilterState) -> Int
+    let onClose: () -> Void
+
+    @State private var expandedSections: Set<GameFilterSection> = [
+        .collections,
+        .genres,
+        .stores,
+        .subscriptions,
+        .playTypes,
+        .features,
+    ]
+
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                colors: sheetBackgroundColors,
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                header
+
+                ScrollView {
+                    VStack(spacing: 16) {
+                        collectionsSection
+
+                        if !options.genres.isEmpty {
+                            valueSection(
+                                section: .genres,
+                                title: L10n.text("genres"),
+                                selectedCount: state.genres.count,
+                                options: options.genres,
+                                selected: { state.genres.contains($0) },
+                                toggle: toggleGenre
+                            )
+                        }
+
+                        if !options.stores.isEmpty {
+                            valueSection(
+                                section: .stores,
+                                title: L10n.text("game_stores"),
+                                selectedCount: state.stores.count,
+                                options: options.stores,
+                                selected: { state.stores.contains($0) },
+                                toggle: toggleStore
+                            )
+                        }
+
+                        if !options.subscriptions.isEmpty {
+                            valueSection(
+                                section: .subscriptions,
+                                title: L10n.text("game_subscriptions"),
+                                selectedCount: state.subscriptions.count,
+                                options: options.subscriptions,
+                                selected: { id in state.subscriptions.contains(where: { $0.rawValue == id }) },
+                                toggle: toggleSubscription
+                            )
+                        }
+
+                        if !options.playTypes.isEmpty {
+                            valueSection(
+                                section: .playTypes,
+                                title: L10n.text("game_filter_play_type"),
+                                selectedCount: state.playTypes.count,
+                                options: options.playTypes,
+                                selected: { id in state.playTypes.contains(where: { $0.rawValue == id }) },
+                                toggle: togglePlayType
+                            )
+                        }
+
+                        if !options.features.isEmpty {
+                            valueSection(
+                                section: .features,
+                                title: L10n.text("features"),
+                                selectedCount: state.features.count,
+                                options: options.features,
+                                selected: { id in state.features.contains(where: { $0.rawValue == id }) },
+                                toggle: toggleFeature
+                            )
+                        }
+                    }
+                    .padding(.horizontal, 70)
+                    .padding(.vertical, 22)
+                }
+            }
+        }
+        .onExitCommand(perform: onClose)
+        .blocksGlobalControllerNavigation()
+    }
+
+    private var sheetBackgroundColors: [Color] {
+        if colorScheme == .dark {
+            [Color(white: 0.055), Color(white: 0.11)]
+        } else {
+            [Color(white: 0.98), Color(white: 0.9)]
+        }
+    }
+
+    private var header: some View {
+        let resultCount = previewCount(state)
+
+        return HStack(spacing: 20) {
+            Image(systemName: "line.3.horizontal.decrease.circle.fill")
+                .font(.title3)
+                .foregroundStyle(.green)
+            Text(L10n.text("filters"))
+                .font(.title2.weight(.bold))
+
+            if state.activeSelectionCount > 0 {
+                Text("\(state.activeSelectionCount)")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.black)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(.green, in: Capsule())
+            }
+
+            Text(L10n.format("games_result_count", resultCount, totalCount))
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            Button {
+                state.clear()
+            } label: {
+                Label(L10n.text("clear_all"), systemImage: "arrow.counterclockwise")
+            }
+            .buttonStyle(.bordered)
+            .disabled(state.isEmpty)
+
+            Button(action: onClose) {
+                Label(L10n.text("done"), systemImage: "checkmark")
+            }
+            .buttonStyle(.bordered)
+        }
+        .padding(.horizontal, 70)
+        .padding(.vertical, 18)
+        .background(Color.black.opacity(colorScheme == .dark ? 0.38 : 0.04))
+        .overlay(alignment: .bottom) { Divider().opacity(0.6) }
+    }
+
+    @ViewBuilder
+    private var collectionsSection: some View {
+        let collectionOptions = availableCollections
+        if !collectionOptions.isEmpty {
+            FilterAccordionSection(
+                title: L10n.text("collections"),
+                selectedCount: state.collections.count,
+                isExpanded: sectionBinding(.collections)
+            ) {
+                WrappingFilterLayout(horizontalSpacing: 14, verticalSpacing: 14) {
+                    ForEach(collectionOptions) { option in
+                        FilterOptionButton(
+                            label: option.filter.label,
+                            count: option.count,
+                            isSelected: state.collections.contains(option.filter),
+                            action: { toggleCollection(option.filter) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func valueSection(
+        section: GameFilterSection,
+        title: String,
+        selectedCount: Int,
+        options: [GameFilterValueOption],
+        selected: @escaping (String) -> Bool,
+        toggle: @escaping (String) -> Void
+    ) -> some View {
+        FilterAccordionSection(
+            title: title,
+            selectedCount: selectedCount,
+            isExpanded: sectionBinding(section)
+        ) {
+            WrappingFilterLayout(horizontalSpacing: 14, verticalSpacing: 14) {
+                ForEach(options) { option in
+                    FilterOptionButton(
+                        label: option.label,
+                        count: option.count,
+                        isSelected: selected(option.id),
+                        action: { toggle(option.id) }
+                    )
+                }
+            }
+        }
+    }
+
+    private struct CollectionOption: Identifiable {
+        let filter: GameCollectionFilter
+        let count: Int
+        var id: GameCollectionFilter {
+            filter
+        }
+    }
+
+    private var availableCollections: [CollectionOption] {
+        var result: [CollectionOption] = []
+        if context == .store {
+            result.append(CollectionOption(filter: .library, count: options.libraryCount))
+        }
+        result.append(CollectionOption(filter: .favorites, count: options.favoriteCount))
+        return result
+    }
+
+    private func sectionBinding(_ section: GameFilterSection) -> Binding<Bool> {
+        Binding(
+            get: { expandedSections.contains(section) },
+            set: { expanded in
+                if expanded {
+                    expandedSections.insert(section)
+                } else {
+                    expandedSections.remove(section)
+                }
+            }
+        )
+    }
+
+    private func toggleCollection(_ collection: GameCollectionFilter) {
+        if state.collections.contains(collection) {
+            state.collections.remove(collection)
+        } else {
+            state.collections.insert(collection)
+        }
+    }
+
+    private func toggleGenre(_ genre: String) {
+        if state.genres.contains(genre) {
+            state.genres.remove(genre)
+        } else {
+            state.genres.insert(genre)
+        }
+    }
+
+    private func toggleStore(_ store: String) {
+        if state.stores.contains(store) {
+            state.stores.remove(store)
+        } else {
+            state.stores.insert(store)
+        }
+    }
+
+    private func toggleFeature(_ rawValue: String) {
+        guard let feature = GameFeature(rawValue: rawValue) else { return }
+        if state.features.contains(feature) {
+            state.features.remove(feature)
+        } else {
+            state.features.insert(feature)
+        }
+    }
+
+    private func toggleSubscription(_ rawValue: String) {
+        guard let subscription = GameSubscription(rawValue: rawValue) else { return }
+        if state.subscriptions.contains(subscription) {
+            state.subscriptions.remove(subscription)
+        } else {
+            state.subscriptions.insert(subscription)
+        }
+    }
+
+    private func togglePlayType(_ rawValue: String) {
+        guard let playType = GamePlayType(rawValue: rawValue), playType != .unknown else { return }
+        if state.playTypes.contains(playType) {
+            state.playTypes.remove(playType)
+        } else {
+            state.playTypes.insert(playType)
+        }
+    }
+}
+
+struct FilterAccordionSection<Content: View>: View {
+    let title: String
+    let selectedCount: Int
+    @Binding var isExpanded: Bool
+    @ViewBuilder let content: Content
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 14) {
+                    Text(title)
+                        .font(.headline.weight(.semibold))
+                    if selectedCount > 0 {
+                        Text("\(selectedCount)")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(.green, in: Capsule())
+                    }
+                    Spacer()
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 20)
+                .frame(height: 58)
+                .background(
+                    Color.primary.opacity(colorScheme == .dark ? 0.06 : 0.07),
+                    in: RoundedRectangle(cornerRadius: 12)
+                )
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                content
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+    }
+}
+
+struct FilterOptionButton: View {
+    let label: String
+    let count: Int
+    let isSelected: Bool
+    let action: () -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: isSelected ? "checkmark.square.fill" : "square")
+                    .font(.body)
+                    .foregroundStyle(isSelected ? .green : .secondary)
+                Text(label)
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                Text("\(count)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 15)
+            .frame(minHeight: 54)
+            .background(
+                isSelected
+                    ? Color.green.opacity(0.14)
+                    : Color.primary.opacity(colorScheme == .dark ? 0.045 : 0.06),
+                in: RoundedRectangle(cornerRadius: 12)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(
+                        isSelected
+                            ? Color.green.opacity(0.8)
+                            : Color.primary.opacity(colorScheme == .dark ? 0.12 : 0.16),
+                        lineWidth: 1
+                    )
+            }
+        }
+        .buttonStyle(.card)
+        .fixedSize(horizontal: true, vertical: false)
+        .disabled(count == 0)
+    }
+}
+
+struct FilteredGamesEmptyView: View {
+    let hasActiveFilters: Bool
+    let onClearFilters: () -> Void
+    var clearFiltersFocus: FocusState<Bool>.Binding?
+
+    var body: some View {
+        VStack(spacing: 24) {
+            Image(systemName: "line.3.horizontal.decrease.circle")
+                .font(.system(size: 58))
+                .foregroundStyle(.secondary)
+            Text(L10n.text("no_games_match_filters"))
+                .font(.title2.weight(.semibold))
+            Text(L10n.text("adjust_search_or_filters"))
+                .foregroundStyle(.secondary)
+            if hasActiveFilters {
+                if let clearFiltersFocus {
+                    clearFiltersButton
+                        .focused(clearFiltersFocus)
+                } else {
+                    clearFiltersButton
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(60)
+    }
+
+    private var clearFiltersButton: some View {
+        Button {
+            onClearFilters()
+        } label: {
+            Label(L10n.text("clear_filters"), systemImage: "xmark.circle")
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(.green)
+    }
+}

@@ -1,0 +1,157 @@
+import Foundation
+import os.log
+
+private let serverInfoLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "ServerInfo")
+
+/// One selectable GFN region from /v2/serverInfo. Mirrors the official client's
+/// Server Location dropdown entries: `name` is the display label, used verbatim.
+struct GFNRegion: Identifiable, Equatable {
+    let name: String
+    /// https URL with trailing slash, usable directly as a CloudMatch base.
+    let address: String
+    var id: String {
+        name
+    }
+}
+
+struct GFNServerInfo: Equatable {
+    let regions: [GFNRegion]
+    /// Server-detected best region for this network — the Automatic target.
+    let localRegionName: String?
+    let vpcId: String?
+}
+
+/// Fetches the region list the same way the official GFN web client does:
+/// `GET <streamingServiceUrl>/v2/serverInfo`. The response's `metaData` array
+/// carries a `gfn-regions` CSV of region display names, one entry per region
+/// name whose value is that region's address, and `local-region` with the
+/// server-detected region for the caller's network.
+@MainActor
+final class ServerInfoClient {
+    static let shared = ServerInfoClient()
+
+    /// Last successful fetch. Expired data remains available as a conservative
+    /// fallback when a refresh fails.
+    private(set) var cached: GFNServerInfo?
+    private var cachedAt: Date?
+    private var cachedBaseURL: String?
+    private let transport: any HTTPTransport
+    private let uuid: @Sendable () -> UUID
+    private let deviceId: @Sendable () -> String
+    private let now: @Sendable () -> Date
+    private let cacheTTL: TimeInterval
+
+    init(
+        transport: any HTTPTransport = URLSessionHTTPTransport(),
+        uuid: @escaping @Sendable () -> UUID = UUID.init,
+        deviceId: @escaping @Sendable () -> String = GFNDeviceIdentity.stableDeviceId,
+        now: @escaping @Sendable () -> Date = Date.init,
+        cacheTTL: TimeInterval = 15 * 60
+    ) {
+        self.transport = transport
+        self.uuid = uuid
+        self.deviceId = deviceId
+        self.now = now
+        self.cacheTTL = cacheTTL
+    }
+
+    /// Cached info, but only when fetched from `url`. Expired data remains a
+    /// valid conservative fallback when a provider-scoped refresh fails.
+    func cachedForBase(_ url: String) -> GFNServerInfo? {
+        guard let cachedBaseURL else { return nil }
+        return Self.normalizedBase(cachedBaseURL)
+            .caseInsensitiveCompare(Self.normalizedBase(url)) == .orderedSame
+            ? cached
+            : nil
+    }
+
+    func fetch(baseUrl: String, token: String) async throws -> GFNServerInfo {
+        let base = Self.normalizedBase(baseUrl)
+
+        if let cached,
+           cachedBaseURL == base,
+           let cachedAt
+        {
+            let age = now().timeIntervalSince(cachedAt)
+            if age >= 0, age < cacheTTL {
+                return cached
+            }
+        }
+
+        guard let url = URL(string: "\(base)/v2/serverInfo") else {
+            throw URLError(.badURL)
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        for (key, value) in gfnHeaders(token: token, clientId: uuid().uuidString, deviceId: deviceId()) {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+
+        let (data, response) = try await transport.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        guard status == 200 else {
+            let body = redactedHTTPBody(data)
+            serverInfoLog.error("serverInfo failed: \(status) body=\(body, privacy: .public)")
+            throw URLError(.badServerResponse)
+        }
+
+        let info = try Self.parse(data)
+        serverInfoLog.info("serverInfo: \(info.regions.count) regions, local=\(info.localRegionName ?? "nil", privacy: .public)")
+        cached = info
+        cachedAt = now()
+        cachedBaseURL = base
+        return info
+    }
+
+    private static func normalizedBase(_ raw: String) -> String {
+        var base = raw
+        while base.hasSuffix("/") {
+            base.removeLast()
+        }
+        return base
+    }
+
+    /// Mirrors the official client's buildZonesFromGfnRegions: `gfn-regions` lists the
+    /// region names; each name is itself a metaData key whose value is the address.
+    static func parse(_ data: Data) throws -> GFNServerInfo {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let metaData = root["metaData"] as? [[String: Any]]
+        else {
+            serverInfoLog.error("serverInfo parse: unexpected shape \(String(data: data.prefix(300), encoding: .utf8) ?? "", privacy: .public)")
+            throw URLError(.cannotParseResponse)
+        }
+
+        var valueByKey: [String: String] = [:]
+        for entry in metaData {
+            if let key = entry["key"] as? String {
+                valueByKey[key] = entry["value"] as? String
+            }
+        }
+
+        let regionNames = (valueByKey["gfn-regions"] ?? "")
+            .components(separatedBy: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let regions: [GFNRegion] = regionNames.compactMap { name in
+            guard let raw = valueByKey[name], !raw.isEmpty else { return nil }
+            return GFNRegion(name: name, address: normalizedAddress(raw))
+        }
+
+        return GFNServerInfo(
+            regions: regions,
+            localRegionName: valueByKey["local-region"],
+            vpcId: root["vpcId"] as? String
+        )
+    }
+
+    private static func normalizedAddress(_ raw: String) -> String {
+        var address = raw.trimmingCharacters(in: .whitespaces)
+        if !address.lowercased().hasPrefix("http") {
+            address = "https://" + address
+        }
+        if !address.hasSuffix("/") {
+            address += "/"
+        }
+        return address
+    }
+}

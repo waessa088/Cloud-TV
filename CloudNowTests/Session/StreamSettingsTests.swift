@@ -1,0 +1,429 @@
+@testable import CloudNow
+import Foundation
+import Testing
+
+@Suite("Stream settings and migrations")
+struct StreamSettingsTests {
+    struct DoubleClampCase: Sendable {
+        let input: Double
+        let expected: Double
+    }
+
+    struct IntClampCase: Sendable {
+        let input: Int
+        let expected: Int
+    }
+
+    @Test("Defaults describe the preferred tvOS streaming profile")
+    func defaults() {
+        let settings = StreamSettings()
+
+        #expect(settings.resolution == "1920x1080")
+        #expect(settings.fps == 60)
+        #expect(settings.maxBitrateKbps == 100_000)
+        #expect(settings.codec == .automatic)
+        #expect(settings.codec.resolvedCodec == .h265)
+        #expect(settings.colorPreference == .automatic)
+        #expect(settings.chromaFormat == .yuv444)
+        #expect(settings.keyboardLayout == StreamSettings.defaultKeyboardLayout)
+        #expect(settings.gameLanguage == StreamSettings.automaticGameLanguage)
+        #expect(settings.enableL4S)
+        #expect(!settings.adaptiveFramePacing)
+        #expect(!settings.micEnabled)
+        #expect(settings.rumbleEnabled)
+        #expect(settings.rumbleIntensity == 1)
+        #expect(settings.controllerDeadzone == 0.15)
+        #expect(settings.overlayTriggerButton == .start)
+        #expect(settings.textInputTriggerSequence == StreamSettings.defaultTextInputTriggerSequence)
+        #expect(settings.textInputTriggerDelayMs == StreamSettings.defaultTextInputTriggerDelayMs)
+        #expect(settings.enableSteamOverlayGesture)
+        #expect(settings.defaultRemoteInputMode == .gamepad)
+        #expect(settings.serverRoutingMode == .serverAuto)
+        #expect(settings.preferredZoneUrl == nil)
+        #expect(settings.statsMode == .off)
+        #expect(!settings.diagnosticsEnabled)
+        #expect(!settings.enableRtcEventLog)
+        #expect(settings.appLaunchMode == .bigPicture)
+        #expect(settings.persistInGameSettings)
+        #expect(
+            settings.sessionEndWarningMinutes
+                == StreamSettings.defaultSessionEndWarningMinutes
+        )
+        #expect(settings.audioFormat == .automatic)
+    }
+
+    @Test("Maximum bitrate is clamped to the selectable ceiling")
+    func maximumBitrateClamping() {
+        var settings = StreamSettings()
+
+        settings.maxBitrateKbps = StreamSettings.maxSelectableBitrateKbps + 50000
+
+        #expect(settings.maxBitrateKbps == StreamSettings.maxSelectableBitrateKbps)
+    }
+
+    @Test(
+        "Controller deadzone clamps both bounds",
+        arguments: [
+            DoubleClampCase(input: -1, expected: 0),
+            DoubleClampCase(input: 0.2, expected: 0.2),
+            DoubleClampCase(input: 1, expected: 0.3),
+        ]
+    )
+    func controllerDeadzoneClamping(testCase: DoubleClampCase) {
+        var settings = StreamSettings()
+        settings.controllerDeadzone = testCase.input
+
+        #expect(settings.controllerDeadzone == testCase.expected)
+    }
+
+    @Test(
+        "Rumble intensity clamps both bounds",
+        arguments: [
+            DoubleClampCase(input: -0.1, expected: 0),
+            DoubleClampCase(input: 1.25, expected: 1.25),
+            DoubleClampCase(input: 3, expected: 2),
+        ]
+    )
+    func rumbleIntensityClamping(testCase: DoubleClampCase) {
+        var settings = StreamSettings()
+        settings.rumbleIntensity = testCase.input
+
+        #expect(settings.rumbleIntensity == testCase.expected)
+    }
+
+    @Test(
+        "Session end warning clamps both bounds",
+        arguments: [
+            IntClampCase(input: -1, expected: 1),
+            IntClampCase(input: 20, expected: 20),
+            IntClampCase(input: 90, expected: 60),
+        ]
+    )
+    func sessionEndWarningClamping(testCase: IntClampCase) {
+        var settings = StreamSettings()
+
+        settings.sessionEndWarningMinutes = testCase.input
+
+        #expect(settings.sessionEndWarningMinutes == testCase.expected)
+    }
+
+    @Test("Current settings round-trip through Codable")
+    func codableRoundTrip() throws {
+        var expected = StreamSettings()
+        expected.resolution = "2560x1440"
+        expected.fps = 120
+        expected.maxBitrateKbps = 75000
+        expected.codec = .h265
+        expected.colorPreference = .preferSDR10
+        expected.chromaFormat = .yuv444
+        expected.keyboardLayout = "de-DE"
+        expected.gameLanguage = "fr_FR"
+        expected.enableL4S = true
+        expected.adaptiveFramePacing = true
+        expected.micEnabled = true
+        expected.rumbleEnabled = false
+        expected.rumbleIntensity = 1.5
+        expected.controllerDeadzone = 0.05
+        expected.overlayTriggerButton = .options
+        expected.textInputTriggerSequence = ControllerButtonSequence(buttons: [.menu, .buttonX])
+        expected.textInputTriggerDelayMs = 400
+        expected.enableSteamOverlayGesture = false
+        expected.defaultRemoteInputMode = .dualsense
+        expected.serverRoutingMode = .region
+        expected.preferredRegionName = "EU Central"
+        expected.preferredRegionAddress = "https://eu.example.invalid/"
+        expected.statsMode = .compact
+        expected.diagnosticsEnabled = true
+        expected.enableRtcEventLog = true
+        expected.appLaunchMode = .default
+        expected.persistInGameSettings = false
+        expected.sessionEndWarningMinutes = 30
+        expected.audioFormat = .surround51
+
+        let encoded = try JSONEncoder().encode(expected)
+        let decoded = try JSONDecoder().decode(StreamSettings.self, from: encoded)
+
+        #expect(decoded == expected)
+    }
+
+    @Test("An older document with missing keys receives every current default")
+    func missingKeysUseDefaults() throws {
+        let decoded = try decodeFixture("minimal.json")
+
+        #expect(decoded == StreamSettings())
+    }
+
+    @Test(
+        "Automatic resolves to HEVC and explicit codec choices survive persistence",
+        arguments: [
+            (VideoCodec.automatic, VideoCodec.h265),
+            (.h264, .h264),
+            (.h265, .h265),
+            (.av1, .av1),
+        ]
+    )
+    func codecPreferencePersistence(codec: VideoCodec, resolvedCodec: VideoCodec) throws {
+        var settings = StreamSettings()
+        settings.codec = codec
+
+        let decoded = try JSONDecoder().decode(StreamSettings.self, from: JSONEncoder().encode(settings))
+
+        #expect(decoded.codec == codec)
+        #expect(decoded.codec.resolvedCodec == resolvedCodec)
+    }
+
+    @Test("Chroma selection survives persistence", arguments: ChromaFormat.allCases)
+    func chromaPreferencePersistence(format: ChromaFormat) throws {
+        var settings = StreamSettings()
+        settings.chromaFormat = format
+
+        let decoded = try JSONDecoder().decode(StreamSettings.self, from: JSONEncoder().encode(settings))
+
+        #expect(decoded.chromaFormat == format)
+        #expect(decoded.effectiveChromaFormat == format)
+    }
+
+    @Test("Unknown chroma preferences preserve other saved settings")
+    func unknownChromaPreference() throws {
+        let data = Data(#"{"chromaFormat":"future-format","resolution":"3840x2160","maxBitrateKbps":50000}"#.utf8)
+
+        let decoded = try JSONDecoder().decode(StreamSettings.self, from: data)
+
+        #expect(decoded.chromaFormat == .yuv444)
+        #expect(decoded.resolution == "3840x2160")
+        #expect(decoded.maxBitrateKbps == 50000)
+    }
+
+    @Test("Incompatible codecs use 4:2:0 without losing the HEVC preference", arguments: [VideoCodec.h264, .av1])
+    func chromaPreferenceAcrossCodecChanges(codec: VideoCodec) {
+        var settings = StreamSettings()
+        settings.chromaFormat = .yuv444
+        settings.codec = codec
+
+        #expect(settings.effectiveChromaFormat == .yuv420)
+        #expect(settings.chromaFormat == .yuv444)
+
+        settings.codec = .h265
+        #expect(settings.effectiveChromaFormat == .yuv444)
+    }
+
+    @Test("Adaptive frame pacing survives settings persistence", arguments: [false, true])
+    func adaptiveFramePacingPersistence(enabled: Bool) throws {
+        var settings = StreamSettings()
+        settings.adaptiveFramePacing = enabled
+
+        let encoded = try JSONEncoder().encode(settings)
+        let decoded = try JSONDecoder().decode(StreamSettings.self, from: encoded)
+
+        #expect(decoded.adaptiveFramePacing == enabled)
+        #expect(decoded.normalizedForClient.adaptiveFramePacing == enabled)
+    }
+
+    @Test("Audio preferences survive settings persistence", arguments: AudioFormatPreference.allCases)
+    func audioPreferencePersistence(format: AudioFormatPreference) throws {
+        var settings = StreamSettings()
+        settings.audioFormat = format
+
+        let encoded = try JSONEncoder().encode(settings)
+        let decoded = try JSONDecoder().decode(StreamSettings.self, from: encoded)
+
+        #expect(decoded.audioFormat == format)
+        #expect(decoded.normalizedForClient.audioFormat == format)
+    }
+
+    @Test(
+        "Explicit audio preferences request their full channel count",
+        arguments: [
+            (AudioFormatPreference.stereo, 2),
+            (.surround51, 6),
+            (.surround71, 8),
+        ]
+    )
+    func explicitAudioChannels(format: AudioFormatPreference, expected: Int) {
+        #expect(format.resolvedChannelCount == expected)
+    }
+
+    @Test("Explicit legacy streaming preferences survive new defaults")
+    func explicitLegacyStreamingPreferencesSurviveNewDefaults() throws {
+        let data = Data(
+            #"{"maxBitrateKbps":20000,"codec":"H264","enableL4S":false}"#.utf8
+        )
+
+        let decoded = try JSONDecoder().decode(StreamSettings.self, from: data)
+
+        #expect(decoded.maxBitrateKbps == 20000)
+        #expect(decoded.codec == .h264)
+        #expect(!decoded.enableL4S)
+        #expect(!decoded.adaptiveFramePacing)
+    }
+
+    @Test("Legacy color quality migrates and decoded values still clamp")
+    func legacyColorQualityMigration() throws {
+        let decoded = try decodeFixture("legacy-color.json")
+
+        #expect(decoded.resolution == "3840x2160")
+        #expect(decoded.fps == 120)
+        #expect(decoded.maxBitrateKbps == 100_000)
+        #expect(decoded.codec == .h265)
+        #expect(decoded.colorPreference == .preferHDR)
+        #expect(decoded.rumbleIntensity == 2)
+        #expect(decoded.controllerDeadzone == 0)
+    }
+
+    @Test("Legacy diagnostic HUD preserves diagnostics and a visible standard HUD")
+    func legacyDiagnosticMigration() throws {
+        let decoded = try decodeFixture("legacy-diagnostic.json")
+
+        #expect(decoded.statsMode == .standard)
+        #expect(decoded.diagnosticsEnabled)
+        #expect(decoded.enableRtcEventLog)
+    }
+
+    @Test("Legacy HUD value migrates to off and disables orphaned RTC logging")
+    func legacyHUDMigration() throws {
+        let decoded = try decodeFixture("legacy-hud.json")
+        let normalized = decoded.normalizedForClient
+
+        #expect(decoded.statsMode == .off)
+        #expect(!decoded.diagnosticsEnabled)
+        #expect(!normalized.enableRtcEventLog)
+    }
+
+    @Test("A legacy preferred zone selects client routing")
+    func legacyPreferredZoneMigration() throws {
+        let decoded = try decodeFixture("legacy-zone.json")
+
+        #expect(decoded.serverRoutingMode == .client)
+        #expect(decoded.preferredZoneUrl == "https://np-test.example.invalid/")
+    }
+
+    @Test("Unknown server routing falls back to server automatic")
+    func unknownServerRoutingFallback() throws {
+        let decoded = try decodeFixture("unknown-routing.json")
+
+        #expect(decoded.serverRoutingMode == .serverAuto)
+    }
+
+    @Test("Invalid explicit routing selections normalize to automatic")
+    func invalidRoutingNormalization() {
+        var missingZone = StreamSettings()
+        missingZone.serverRoutingMode = .client
+        missingZone.preferredZoneUrl = nil
+
+        var missingRegion = StreamSettings()
+        missingRegion.serverRoutingMode = .region
+        missingRegion.preferredRegionAddress = nil
+
+        #expect(missingZone.normalizedForClient.serverRoutingMode == .serverAuto)
+        #expect(missingRegion.normalizedForClient.serverRoutingMode == .serverAuto)
+    }
+
+    @Test("Changing overlay policies immediately replaces a conflicting shortcut")
+    func shortcutPolicyChangesRevalidateSequence() {
+        var overlayConflict = StreamSettings()
+        overlayConflict.enableSteamOverlayGesture = false
+        overlayConflict.textInputTriggerSequence = ControllerButtonSequence(buttons: [.options])
+        overlayConflict.overlayTriggerButton = .options
+
+        var steamConflict = StreamSettings()
+        steamConflict.enableSteamOverlayGesture = false
+        steamConflict.textInputTriggerSequence = ControllerButtonSequence(buttons: [.options])
+        steamConflict.enableSteamOverlayGesture = true
+
+        #expect(overlayConflict.textInputTriggerSequence == StreamSettings.defaultTextInputTriggerSequence)
+        #expect(steamConflict.textInputTriggerSequence == StreamSettings.defaultTextInputTriggerSequence)
+    }
+
+    @Test("Persisted invalid shortcuts normalize to the safe default")
+    func invalidShortcutNormalization() throws {
+        var invalid = StreamSettings()
+        invalid.textInputTriggerSequence = ControllerButtonSequence(buttons: [])
+
+        #expect(invalid.normalizedForClient.textInputTriggerSequence == StreamSettings.defaultTextInputTriggerSequence)
+
+        let encoded = try JSONEncoder().encode(invalid)
+        let decoded = try JSONDecoder().decode(StreamSettings.self, from: encoded)
+        #expect(decoded.textInputTriggerSequence == StreamSettings.defaultTextInputTriggerSequence)
+    }
+
+    @Test("Malformed persisted shortcut settings are canonicalized and clamped")
+    func malformedShortcutSettingsNormalization() throws {
+        let data = Data(
+            #"{"textInputTriggerSequence":{"buttons":["menu","menu"]},"textInputTriggerDelayMs":-500}"#.utf8
+        )
+
+        let decoded = try JSONDecoder().decode(StreamSettings.self, from: data)
+
+        #expect(decoded.textInputTriggerSequence == StreamSettings.defaultTextInputTriggerSequence)
+        #expect(decoded.textInputTriggerDelayMs == StreamSettings.minTextInputTriggerDelayMs)
+    }
+
+    @Test("An unknown persisted shortcut button keeps the remaining settings")
+    func unknownShortcutButtonFallback() throws {
+        let data = Data(
+            #"{"resolution":"3840x2160","serverRoutingMode":"region","preferredRegionName":"EU Central","preferredRegionAddress":"https://eu.example.invalid/","textInputTriggerSequence":{"buttons":["telepathy"]}}"#.utf8
+        )
+
+        let decoded = try JSONDecoder().decode(StreamSettings.self, from: data)
+
+        #expect(decoded.resolution == "3840x2160")
+        #expect(decoded.serverRoutingMode == .region)
+        #expect(decoded.preferredRegionName == "EU Central")
+        #expect(decoded.preferredRegionAddress == "https://eu.example.invalid/")
+        #expect(decoded.textInputTriggerSequence == StreamSettings.defaultTextInputTriggerSequence)
+    }
+
+    @Test("RTC event logging cannot remain enabled without diagnostics")
+    func rtcLoggingRequiresDiagnostics() {
+        var settings = StreamSettings()
+        settings.diagnosticsEnabled = false
+        settings.enableRtcEventLog = true
+
+        #expect(!settings.normalizedForClient.enableRtcEventLog)
+    }
+
+    @Test(
+        "Statistics HUD cycles through all user-visible levels",
+        arguments: [
+            (StreamStatsMode.off, StreamStatsMode.compact),
+            (StreamStatsMode.compact, StreamStatsMode.standard),
+            (StreamStatsMode.standard, StreamStatsMode.off),
+        ]
+    )
+    func statsModeCycle(input: StreamStatsMode, expected: StreamStatsMode) {
+        #expect(input.nextHUDLevel == expected)
+    }
+
+    @Test(
+        "App launch modes map to CloudMatch wire values",
+        arguments: [
+            (AppLaunchMode.default, 1),
+            (AppLaunchMode.bigPicture, 2),
+        ]
+    )
+    func appLaunchWireValue(mode: AppLaunchMode, expected: Int) {
+        #expect(mode.cloudMatchValue == expected)
+    }
+
+    @Test("Legacy mouse input mode migrates to simultaneous gamepad and mouse")
+    func remoteInputLegacyMigration() throws {
+        let decoded = try JSONDecoder().decode(RemoteInputMode.self, from: Data(#""mouse""#.utf8))
+
+        #expect(decoded == .gamepadMouse)
+        #expect(decoded.remoteActsAsMouse)
+    }
+
+    @Test("Unknown remote input mode fails decoding")
+    func unknownRemoteInputFails() {
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(RemoteInputMode.self, from: Data(#""telepathy""#.utf8))
+        }
+    }
+
+    private func decodeFixture(_ name: String) throws -> StreamSettings {
+        try JSONDecoder().decode(
+            StreamSettings.self,
+            from: TestFixture.data(name, subdirectory: "Settings")
+        )
+    }
+}

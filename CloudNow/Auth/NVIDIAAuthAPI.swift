@@ -1,0 +1,579 @@
+import CryptoKit
+import Foundation
+import os.log
+import Security
+
+private nonisolated let authLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "Auth")
+
+// MARK: - Constants
+
+nonisolated enum NVIDIAAuth {
+    static let authEndpoint = "https://login.nvidia.com/authorize"
+    static let tokenEndpoint = "https://login.nvidia.com/token"
+    static let deviceAuthorizeEndpoint = "https://login.nvidia.com/device/authorize"
+    static let clientTokenEndpoint = "https://login.nvidia.com/client_token"
+    static let userinfoEndpoint = "https://login.nvidia.com/userinfo"
+    static let serviceUrlsEndpoint = "https://pcs.geforcenow.com/v1/serviceUrls"
+
+    static let clientID = "ZU7sPN-miLujMD95LfOQ453IB0AtjM8sMyvgJ9wCXEQ"
+    static let deviceFlowClientID = "zp4TWyCwtbLiUfcG0_ecveyZEK1OlNiee-8qthakGn8"
+    static let scopes = "openid consent email tk_client age"
+    static let defaultIdpId = "PDiAhv2kJTFeQ7WOPqiQ2tRZ7lGhR2X11dXvM4TZSxg"
+    static let defaultStreamingUrl = "https://prod.cloudmatchbeta.nvidiagrid.net/"
+    static let callbackScheme = "http"
+    static let gfnClientId = "ec7e38d4-03af-4b58-b131-cfb0495903ab"
+    static let gfnClientVersion = "2.0.86.124"
+    static let webOrigin = "https://play.geforcenow.com"
+    static let webReferer = "https://play.geforcenow.com/"
+    static let nvFileOrigin = "https://nvfile"
+    static let nvFileReferer = "https://nvfile/"
+
+    /// Matches the official GFN PC client User-Agent so the NVIDIA backend accepts the token
+    static let userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 NVIDIACEFClient/HEAD/debb5919f6 GFN-PC/\(gfnClientVersion)"
+}
+
+nonisolated enum GFNDeviceIdentity {
+    private static let defaultsKey = "gfn.stableDeviceId"
+
+    static func stableDeviceId() -> String {
+        let defaults = UserDefaults.standard
+        if let existing = defaults.string(forKey: defaultsKey), !existing.isEmpty {
+            return existing
+        }
+        let generated = UUID().uuidString
+        defaults.set(generated, forKey: defaultsKey)
+        return generated
+    }
+}
+
+// MARK: - PKCE Helpers
+
+nonisolated struct PKCE {
+    let verifier: String
+    let challenge: String
+
+    static func generate() -> PKCE {
+        var bytes = [UInt8](repeating: 0, count: 64)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        let verifier = Data(bytes)
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+            .prefix(86)
+        let verifierStr = String(verifier)
+        let challengeData = SHA256.hash(data: Data(verifierStr.utf8))
+        let challenge = Data(challengeData)
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return PKCE(verifier: verifierStr, challenge: challenge)
+    }
+}
+
+// MARK: - Response Models
+
+nonisolated struct AuthTokens: Codable {
+    var accessToken: String
+    var refreshToken: String?
+    var idToken: String?
+    var expiresAt: Date
+    var clientToken: String?
+    var clientTokenExpiresAt: Date?
+
+    var isExpired: Bool {
+        expiresAt < Date()
+    }
+
+    var isNearExpiry: Bool {
+        expiresAt.timeIntervalSinceNow < 10 * 60
+    }
+}
+
+nonisolated struct AuthUser: Codable {
+    let userId: String
+    let displayName: String
+    let email: String?
+    let avatarUrl: String?
+    var membershipTier: String
+}
+
+nonisolated struct DeviceFlowResponse: Codable {
+    let userCode: String
+    let deviceCode: String
+    let verificationUri: String
+    let verificationUriComplete: String
+    let expiresIn: Int
+    let interval: Int
+}
+
+nonisolated struct LoginProvider: Codable {
+    let idpId: String
+    let code: String
+    let displayName: String
+    var streamingServiceUrl: String
+    let priority: Int
+
+    var isNvidiaDirect: Bool {
+        idpId == NVIDIAAuth.defaultIdpId
+    }
+
+    /// NVIDIA-direct provider used whenever discovery yields nothing. Sign-in paths
+    /// labelled "NVIDIA" pass this explicitly so the action cannot drift to whichever
+    /// provider a later discovery call happens to return first.
+    static let nvidiaDirect = LoginProvider(
+        idpId: NVIDIAAuth.defaultIdpId,
+        code: "NVIDIA",
+        displayName: "NVIDIA",
+        streamingServiceUrl: NVIDIAAuth.defaultStreamingUrl,
+        priority: 0
+    )
+}
+
+// MARK: - NVIDIA OAuth API
+
+actor NVIDIAAuthAPI {
+    private let transport: any HTTPTransport
+    private let now: @Sendable () -> Date
+    private let uuid: @Sendable () -> UUID
+    private let sleep: @Sendable (TimeInterval) async throws -> Void
+
+    init(
+        transport: any HTTPTransport = URLSessionHTTPTransport(configuration: .default),
+        now: @escaping @Sendable () -> Date = Date.init,
+        uuid: @escaping @Sendable () -> UUID = UUID.init,
+        sleep: @escaping @Sendable (TimeInterval) async throws -> Void = { seconds in
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        }
+    ) {
+        self.transport = transport
+        self.now = now
+        self.uuid = uuid
+        self.sleep = sleep
+    }
+
+    // MARK: Providers
+
+    func fetchProviders() async throws -> [LoginProvider] {
+        var request = URLRequest(url: URL(string: NVIDIAAuth.serviceUrlsEndpoint)!)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, response) = try await perform(request)
+        try validateHTTP(response, data: data, context: "Provider discovery")
+        let payload = try JSONDecoder().decode(ServiceUrlsResponse.self, from: data)
+        let info = payload.gfnServiceInfo
+        let endpoints = info?.gfnServiceEndpoints ?? []
+
+        // NVIDIA advertises which providers apply to the caller's region. Those sort
+        // first, with defaultProvider ahead of them so it receives initial focus.
+        // Non-preferred endpoints stay listed: a travelling user still needs to reach
+        // their home provider, and a misdetected region must not lock anyone out.
+        // With no metadata this falls back to the advertised priority order.
+        let defaultCode = info?.defaultProvider ?? payload.defaultProvider
+        let preferredCodes = Set(
+            info?.loginPreferredProviders ?? payload.loginPreferredProviders ?? []
+        )
+
+        func preferenceRank(_ provider: LoginProvider) -> Int {
+            if let defaultCode, provider.code == defaultCode {
+                return 0
+            }
+            return preferredCodes.contains(provider.code) ? 1 : 2
+        }
+
+        return endpoints.map { entry in
+            LoginProvider(
+                idpId: entry.idpId,
+                code: entry.loginProviderCode,
+                displayName: entry.loginProviderCode == "BPC" ? "bro.game" : entry.loginProviderDisplayName,
+                streamingServiceUrl: entry.streamingServiceUrl.hasSuffix("/") ? entry.streamingServiceUrl : "\(entry.streamingServiceUrl)/",
+                priority: entry.loginProviderPriority ?? 0
+            )
+        }.sorted { lhs, rhs in
+            let lhsRank = preferenceRank(lhs)
+            let rhsRank = preferenceRank(rhs)
+            return lhsRank == rhsRank ? lhs.priority < rhs.priority : lhsRank < rhsRank
+        }
+    }
+
+    // MARK: Token Exchange
+
+    func exchangeCode(_ code: String, verifier: String, redirectURI: String) async throws -> AuthTokens {
+        var request = URLRequest(url: URL(string: NVIDIAAuth.tokenEndpoint)!)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
+        request.setValue("https://nvfile", forHTTPHeaderField: "Origin")
+        request.setValue("https://nvfile/", forHTTPHeaderField: "Referer")
+        request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+        request.httpBody = Self.formURLEncoded([
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirectURI),
+            ("code_verifier", verifier),
+        ])
+        let (data, response) = try await perform(request)
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+        guard statusCode == 200 else {
+            throw AuthError.tokenExchangeFailed("HTTP \(statusCode): \(redactedHTTPBody(data))")
+        }
+        return try parseTokenResponse(data)
+    }
+
+    // MARK: Token Refresh
+
+    func refreshTokens(_ refreshToken: String) async throws -> AuthTokens {
+        var request = URLRequest(url: URL(string: NVIDIAAuth.tokenEndpoint)!)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
+        request.setValue("https://nvfile", forHTTPHeaderField: "Origin")
+        // Try device-flow clientID first since that's what initially issued the token.
+        // Trying the wrong clientID first risks NVIDIA revoking a single-use refresh token
+        // on the failed attempt, leaving nothing for the correct retry.
+        for clientID in [NVIDIAAuth.deviceFlowClientID, NVIDIAAuth.clientID] {
+            request.httpBody = Self.formURLEncoded([
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refreshToken),
+                ("client_id", clientID),
+            ])
+            let (data, response) = try await perform(request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            authLog.debug("[Auth] refreshTokens with clientID=\(clientID.prefix(8), privacy: .public)… → HTTP \(statusCode, privacy: .public)")
+            if statusCode == 200 {
+                return try parseTokenResponse(data)
+            }
+            if statusCode < 400 || statusCode >= 500 {
+                throw AuthError.tokenRefreshFailed("HTTP \(statusCode): \(redactedHTTPBody(data))")
+            }
+        }
+        throw AuthError.tokenRefreshFailed("Refresh token rejected by all known client IDs.")
+    }
+
+    // MARK: Client Token
+
+    func fetchClientToken(accessToken: String) async throws -> (token: String, expiresAt: Date) {
+        var request = URLRequest(url: URL(string: NVIDIAAuth.clientTokenEndpoint)!)
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("https://nvfile", forHTTPHeaderField: "Origin")
+        request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+        let (data, response) = try await perform(request)
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard statusCode == 200 else {
+            let body = redactedHTTPBody(data)
+            throw AuthError.clientTokenFailed("HTTP \(statusCode): \(body)")
+        }
+        let payload = try JSONDecoder().decode(ClientTokenResponse.self, from: data)
+        let expiresAt = now().addingTimeInterval(TimeInterval(payload.expires_in ?? 86400))
+        return (payload.client_token, expiresAt)
+    }
+
+    /// Exchanges a client_token for fresh OAuth tokens bound to the main clientID.
+    /// This is the primary refresh mechanism used by the official GFN client and
+    /// re-binds tokens regardless of which OAuth client originally issued them
+    /// (e.g. device flow client → main client).
+    func refreshWithClientToken(_ clientToken: String, userId: String) async throws -> AuthTokens {
+        var request = URLRequest(url: URL(string: NVIDIAAuth.tokenEndpoint)!)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
+        request.setValue("https://nvfile", forHTTPHeaderField: "Origin")
+        request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+        // Try main clientID first, then device-flow clientID as fallback.
+        // The stored clientToken may have been issued under either, depending on
+        // which step of the login flow succeeded.
+        var lastError: Error = AuthError.clientTokenFailed("No client IDs tried")
+        for clientID in [NVIDIAAuth.clientID, NVIDIAAuth.deviceFlowClientID] {
+            request.httpBody = Self.formURLEncoded([
+                ("grant_type", "urn:ietf:params:oauth:grant-type:client_token"),
+                ("client_token", clientToken),
+                ("client_id", clientID),
+                ("sub", userId),
+            ])
+            let (data, response) = try await perform(request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if statusCode == 200 {
+                return try parseTokenResponse(data)
+            }
+            let responseBody = redactedHTTPBody(data)
+            lastError = AuthError.clientTokenFailed("HTTP \(statusCode): \(responseBody)")
+            if statusCode < 400 || statusCode >= 500 {
+                throw lastError
+            }
+            // 4xx with clientID mismatch → try next clientID
+        }
+        throw lastError
+    }
+
+    // MARK: Device Flow (PIN-based login)
+
+    func requestDeviceAuthorization(idpId: String? = nil) async throws -> DeviceFlowResponse {
+        var request = URLRequest(url: URL(string: NVIDIAAuth.deviceAuthorizeEndpoint)!)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        var params = [
+            ("client_id", NVIDIAAuth.deviceFlowClientID),
+            ("scope", NVIDIAAuth.scopes),
+            ("device_id", uuid().uuidString),
+            ("display_name", "Apple TV"),
+        ]
+        if let idpId {
+            params.append(("idp_id", idpId))
+        }
+        request.httpBody = Self.formURLEncoded(params)
+        let (data, response) = try await perform(request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw AuthError.deviceFlowFailed("HTTP \(statusCode): \(redactedHTTPBody(data))")
+        }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(DeviceFlowResponse.self, from: data)
+    }
+
+    func pollForDeviceToken(deviceCode: String, interval: Int, expiresIn: Int) async throws -> AuthTokens {
+        let deadline = now().addingTimeInterval(TimeInterval(expiresIn))
+        var pollInterval = TimeInterval(interval)
+
+        while now() < deadline {
+            try Task.checkCancellation()
+            try await sleep(pollInterval)
+            try Task.checkCancellation()
+
+            var request = URLRequest(url: URL(string: NVIDIAAuth.tokenEndpoint)!)
+            request.httpMethod = "POST"
+            request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.httpBody = Self.formURLEncoded([
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("device_code", deviceCode),
+                ("client_id", NVIDIAAuth.deviceFlowClientID),
+            ])
+            let (data, response) = try await perform(request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+
+            if statusCode == 200 {
+                return try parseTokenResponse(data)
+            }
+
+            // Parse error response
+            if let errorResp = try? JSONDecoder().decode(DeviceFlowErrorResponse.self, from: data) {
+                switch errorResp.error {
+                case "authorization_pending":
+                    continue
+                case "slow_down":
+                    pollInterval += 5
+                    continue
+                case "expired_token":
+                    throw AuthError.deviceFlowExpired
+                case "access_denied":
+                    throw AuthError.deviceFlowDenied
+                default:
+                    throw AuthError.deviceFlowFailed(errorResp.errorDescription ?? errorResp.error)
+                }
+            }
+            throw AuthError.deviceFlowFailed("HTTP \(statusCode): \(redactedHTTPBody(data))")
+        }
+        throw AuthError.deviceFlowExpired
+    }
+
+    // MARK: User Info
+
+    func fetchUserInfo(tokens: AuthTokens) async throws -> AuthUser {
+        // Try JWT payload first (fast path)
+        let jwt = tokens.idToken ?? tokens.accessToken
+        if let user = parseUserFromJWT(jwt) {
+            return user
+        }
+
+        var request = URLRequest(url: URL(string: NVIDIAAuth.userinfoEndpoint)!)
+        request.setValue("Bearer \(tokens.accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("https://nvfile", forHTTPHeaderField: "Origin")
+        let (data, response) = try await perform(request)
+        try validateHTTP(response, data: data, context: "User info")
+        let payload = try JSONDecoder().decode(UserinfoResponse.self, from: data)
+        return AuthUser(
+            userId: payload.sub,
+            displayName: payload.preferred_username ?? payload.email?.components(separatedBy: "@").first ?? "User",
+            email: payload.email,
+            avatarUrl: nil,
+            membershipTier: "FREE"
+        )
+    }
+
+    // MARK: Private Helpers
+
+    nonisolated static func formURLEncoded(_ fields: [(String, String)]) -> Data {
+        let body = fields.map { name, value in
+            "\(formComponent(name))=\(formComponent(value))"
+        }.joined(separator: "&")
+        return Data(body.utf8)
+    }
+
+    private nonisolated static func formComponent(_ value: String) -> String {
+        var encoded = ""
+        encoded.reserveCapacity(value.utf8.count)
+
+        for byte in value.utf8 {
+            switch byte {
+            case 48 ... 57, 65 ... 90, 97 ... 122, 45, 46, 95, 126:
+                encoded.unicodeScalars.append(UnicodeScalar(byte))
+            case 32:
+                encoded.append("+")
+            default:
+                encoded.append(String(format: "%%%02X", byte))
+            }
+        }
+        return encoded
+    }
+
+    private func parseTokenResponse(_ data: Data) throws -> AuthTokens {
+        let payload = try JSONDecoder().decode(TokenResponse.self, from: data)
+        return AuthTokens(
+            accessToken: payload.access_token,
+            refreshToken: payload.refresh_token,
+            idToken: payload.id_token,
+            expiresAt: now().addingTimeInterval(TimeInterval(payload.expires_in ?? 86400)),
+            clientToken: payload.client_token,
+            clientTokenExpiresAt: payload.client_token_expires_in.map {
+                now().addingTimeInterval(TimeInterval($0))
+            }
+        )
+    }
+
+    private func parseUserFromJWT(_ jwt: String) -> AuthUser? {
+        let parts = jwt.split(separator: ".")
+        guard parts.count == 3 else { return nil }
+        var base64 = parts[1]
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        while base64.count % 4 != 0 {
+            base64 += "="
+        }
+        guard let data = Data(base64Encoded: base64),
+              let payload = try? JSONDecoder().decode(JWTPayload.self, from: data),
+              let sub = payload.sub
+        else { return nil }
+        return AuthUser(
+            userId: sub,
+            displayName: payload.preferred_username ?? payload.email?.components(separatedBy: "@").first ?? "User",
+            email: payload.email,
+            avatarUrl: payload.picture,
+            membershipTier: payload.gfn_tier ?? "FREE"
+        )
+    }
+
+    private func perform(_ originalRequest: URLRequest) async throws -> (Data, URLResponse) {
+        var request = originalRequest
+        if request.value(forHTTPHeaderField: "User-Agent") == nil {
+            request.setValue(NVIDIAAuth.userAgent, forHTTPHeaderField: "User-Agent")
+        }
+        return try await transport.data(for: request)
+    }
+
+    private func validateHTTP(_ response: URLResponse, data: Data, context: String) throws {
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+        guard (200 ..< 300).contains(statusCode) else {
+            throw AuthError.requestFailed(
+                context: context,
+                statusCode: statusCode,
+                message: redactedHTTPBody(data)
+            )
+        }
+    }
+
+    private nonisolated func randomHex(_ byteCount: Int) -> String {
+        var bytes = [UInt8](repeating: 0, count: byteCount)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+// MARK: - Codable Response Types
+
+private nonisolated struct ServiceUrlsResponse: Decodable {
+    let gfnServiceInfo: GFNServiceInfo?
+    /// Preference metadata has been observed alongside the endpoints; accept it at
+    /// the root too so a change in nesting degrades to "no preference" rather than
+    /// a decode failure.
+    let defaultProvider: String?
+    let loginPreferredProviders: [String]?
+    struct GFNServiceInfo: Decodable {
+        let gfnServiceEndpoints: [Endpoint]?
+        let defaultProvider: String?
+        let loginPreferredProviders: [String]?
+        struct Endpoint: Decodable {
+            let idpId: String
+            let loginProviderCode: String
+            let loginProviderDisplayName: String
+            let streamingServiceUrl: String
+            let loginProviderPriority: Int?
+        }
+    }
+}
+
+private nonisolated struct TokenResponse: Decodable {
+    let access_token: String
+    let refresh_token: String?
+    let id_token: String?
+    let expires_in: Int?
+    let client_token: String?
+    let client_token_expires_in: Int?
+}
+
+private nonisolated struct ClientTokenResponse: Decodable {
+    let client_token: String
+    let expires_in: Int?
+}
+
+private nonisolated struct UserinfoResponse: Decodable {
+    let sub: String
+    let preferred_username: String?
+    let email: String?
+}
+
+private nonisolated struct DeviceFlowErrorResponse: Decodable {
+    let error: String
+    let errorDescription: String?
+    enum CodingKeys: String, CodingKey {
+        case error
+        case errorDescription = "error_description"
+    }
+}
+
+private nonisolated struct JWTPayload: Decodable {
+    let sub: String?
+    let email: String?
+    let preferred_username: String?
+    let picture: String?
+    let gfn_tier: String?
+}
+
+// MARK: - Errors
+
+enum AuthError: Error, LocalizedError {
+    case noAuthCode
+    case tokenExchangeFailed(String)
+    case tokenRefreshFailed(String)
+    case clientTokenFailed(String)
+    case noSession
+    case deviceFlowFailed(String)
+    case deviceFlowExpired
+    case deviceFlowDenied
+    case secureStorageUnavailable
+    case requestFailed(context: String, statusCode: Int, message: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noAuthCode: "No authorization code received."
+        case let .tokenExchangeFailed(msg): "Token exchange failed: \(msg)"
+        case let .tokenRefreshFailed(msg): "Token refresh failed: \(msg)"
+        case let .clientTokenFailed(msg): "Failed to obtain client token: \(msg)"
+        case .noSession: "No authenticated session."
+        case let .deviceFlowFailed(msg): "Device login failed: \(msg)"
+        case .deviceFlowExpired: "Login code expired. Please try again."
+        case .deviceFlowDenied: "Login was denied."
+        case .secureStorageUnavailable: "Secure account storage is unavailable."
+        case let .requestFailed(context, statusCode, message):
+            "\(context) failed: HTTP \(statusCode): \(message)"
+        }
+    }
+}
