@@ -267,6 +267,7 @@ final class VideoSurfaceView: UIView {
         #if os(tvOS)
             displayLayer.videoGravity = .resizeAspectFill
         #else
+            installSystemPointerSupport()
             // iPad screens are not 16:9: fill would crop the sides of the game,
             // so show the whole frame and letterbox the remainder.
             displayLayer.videoGravity = .resizeAspect
@@ -394,6 +395,11 @@ final class VideoSurfaceView: UIView {
     // MARK: - Siri Remote Touch Surface
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        #if os(iOS)
+            if handlePointerTouches(touches, event: event, phase: .began) {
+                return
+            }
+        #endif
         guard remoteMouseInputEnabled,
               activeRemoteTouch == nil,
               let touch = touches.first(where: isRemoteTouch)
@@ -407,6 +413,11 @@ final class VideoSurfaceView: UIView {
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        #if os(iOS)
+            if handlePointerTouches(touches, event: event, phase: .moved) {
+                return
+            }
+        #endif
         guard remoteMouseInputEnabled else {
             clearRemoteTouchTracking()
             super.touchesMoved(touches, with: event)
@@ -426,6 +437,11 @@ final class VideoSurfaceView: UIView {
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        #if os(iOS)
+            if handlePointerTouches(touches, event: event, phase: .ended) {
+                return
+            }
+        #endif
         guard let trackedTouch = activeRemoteTouch,
               touches.contains(where: { $0 === trackedTouch })
         else {
@@ -438,6 +454,11 @@ final class VideoSurfaceView: UIView {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        #if os(iOS)
+            if handlePointerTouches(touches, event: event, phase: .ended) {
+                return
+            }
+        #endif
         guard let trackedTouch = activeRemoteTouch,
               touches.contains(where: { $0 === trackedTouch })
         else {
@@ -466,6 +487,95 @@ final class VideoSurfaceView: UIView {
         guard packetDX != 0 || packetDY != 0 else { return }
         inputHandler?.sendMouseMove(dx: packetDX, dy: packetDY)
     }
+
+    #if os(iOS)
+        // MARK: - iPadOS system pointer (Universal Control, trackpad)
+
+        /// Pointer input that is not a GameController mouse: the Mac's keyboard and
+        /// trackpad through Universal Control, or a trackpad. Converted to the same
+        /// relative moves as GCMouse. Skipped while a GCMouse is connected, which
+        /// already reports raw deltas and clicks.
+        enum PointerPhase {
+            case began
+            case moved
+            case ended
+        }
+
+        private static let pointerSensitivity: CGFloat = 1.6
+        private var lastHoverLocation: CGPoint?
+        private var pressedPointerButton: UInt8?
+        private var lastScrollTranslation: CGFloat = 0
+
+        private var systemPointerDrivesGame: Bool {
+            !overlayVisible && GCMouse.mice().isEmpty
+        }
+
+        func installSystemPointerSupport() {
+            let hover = UIHoverGestureRecognizer(target: self, action: #selector(handlePointerHover(_:)))
+            addGestureRecognizer(hover)
+            let scroll = UIPanGestureRecognizer(target: self, action: #selector(handlePointerScroll(_:)))
+            scroll.allowedScrollTypesMask = .all
+            scroll.allowedTouchTypes = []
+            addGestureRecognizer(scroll)
+        }
+
+        @objc private func handlePointerHover(_ recognizer: UIHoverGestureRecognizer) {
+            let location = recognizer.location(in: self)
+            defer { lastHoverLocation = recognizer.state == .ended ? nil : location }
+            guard systemPointerDrivesGame,
+                  recognizer.state == .changed,
+                  let previous = lastHoverLocation
+            else { return }
+            forwardPointerDelta(from: previous, to: location)
+        }
+
+        @objc private func handlePointerScroll(_ recognizer: UIPanGestureRecognizer) {
+            guard systemPointerDrivesGame else { return }
+            switch recognizer.state {
+            case .began:
+                lastScrollTranslation = 0
+            case .changed:
+                let translation = recognizer.translation(in: self).y
+                let steps = Int(((translation - lastScrollTranslation) / 12).rounded(.towardZero))
+                guard steps != 0 else { return }
+                lastScrollTranslation += CGFloat(steps) * 12
+                inputHandler?.sendMouseWheel(delta: Int16(clamping: steps * 3))
+            default:
+                lastScrollTranslation = 0
+            }
+        }
+
+        /// Returns true when the touches were pointer clicks or drags it handled.
+        func handlePointerTouches(_ touches: Set<UITouch>, event: UIEvent?, phase: PointerPhase) -> Bool {
+            guard let touch = touches.first(where: { $0.type == .indirectPointer }) else { return false }
+            guard systemPointerDrivesGame else { return !overlayVisible }
+            switch phase {
+            case .began:
+                let button: UInt8 = event?.buttonMask.contains(.secondary) == true ? 3 : 1
+                pressedPointerButton = button
+                lastHoverLocation = touch.location(in: self)
+                inputHandler?.sendMouseButton(down: true, button: button)
+            case .moved:
+                let previous = lastHoverLocation ?? touch.previousLocation(in: self)
+                let location = touch.location(in: self)
+                lastHoverLocation = location
+                forwardPointerDelta(from: previous, to: location)
+            case .ended:
+                if let button = pressedPointerButton {
+                    inputHandler?.sendMouseButton(down: false, button: button)
+                }
+                pressedPointerButton = nil
+            }
+            return true
+        }
+
+        private func forwardPointerDelta(from previous: CGPoint, to location: CGPoint) {
+            let dx = Int16(clamping: Int(((location.x - previous.x) * Self.pointerSensitivity).rounded()))
+            let dy = Int16(clamping: Int(((location.y - previous.y) * Self.pointerSensitivity).rounded()))
+            guard dx != 0 || dy != 0 else { return }
+            inputHandler?.sendMouseMove(dx: dx, dy: dy)
+        }
+    #endif
 
     private var remoteMouseInputEnabled: Bool {
         !gamepadModeActive && !overlayVisible
@@ -963,31 +1073,22 @@ final class StreamingViewController: GCEventViewController {
     }
 
     #if os(iOS)
-        /// iPadOS: during gameplay the mouse drives the game's own cursor through
-        /// GCMouse deltas, so the system pointer is locked and hidden. While the
-        /// pause menu is open the pointer comes back to click its buttons.
+        /// iPadOS: during gameplay the game draws its own cursor, so the system
+        /// pointer is hidden over the video (it comes back in the pause menu). It
+        /// is deliberately not locked, so a Universal Control pointer can still
+        /// leave the iPad for the Mac at the screen edge.
         var capturesPointer = true {
             didSet {
                 guard capturesPointer != oldValue else { return }
-                setNeedsUpdateOfPrefersPointerLocked()
                 pointerInteraction.invalidate()
             }
         }
 
         private lazy var pointerInteraction = UIPointerInteraction(delegate: self)
 
-        override var prefersPointerLocked: Bool {
-            capturesPointer
-        }
-
         override func viewDidLoad() {
             super.viewDidLoad()
             videoSurface.addInteraction(pointerInteraction)
-        }
-
-        override func viewDidAppear(_ animated: Bool) {
-            super.viewDidAppear(animated)
-            setNeedsUpdateOfPrefersPointerLocked()
         }
     #endif
 }
