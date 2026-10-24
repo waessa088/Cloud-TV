@@ -60,7 +60,7 @@ nonisolated enum RelayedGamepadPacket {
         return (token, sequence, state)
     }
 
-    private static func append<T: FixedWidthInteger>(_ data: inout Data, _ value: T) {
+    private static func append(_ data: inout Data, _ value: some FixedWidthInteger) {
         withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
     }
 
