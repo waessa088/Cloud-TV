@@ -152,14 +152,7 @@ struct CloudGameCarouselView<Item: Identifiable, Card: View>: View {
         }
         .ignoresSafeArea()
         .defaultFocus($focusedID, startID)
-        #if os(tvOS)
-            .onMoveCommand(perform: handleMoveCommand)
-        #else
-            .simultaneousGesture(
-                DragGesture(minimumDistance: 40)
-                    .onEnded(handleSwipe)
-            )
-        #endif
+        .carouselDirectionalInput(perform: handleCarouselStep)
         .handlesCarouselControllerNavigation(
             isEnabled: expandedID == nil,
             onPrevious: { moveCurrentCard(by: -1) },
@@ -213,35 +206,18 @@ struct CloudGameCarouselView<Item: Identifiable, Card: View>: View {
         focusedID = destinationID
     }
 
-    #if os(tvOS)
-        private func handleMoveCommand(_ direction: MoveCommandDirection) {
-            guard expandedID == nil else { return }
+    private func handleCarouselStep(_ step: CarouselStep) {
+        guard expandedID == nil else { return }
 
-            switch direction {
-            case .left:
-                moveCurrentCard(by: -1)
-            case .right:
-                moveCurrentCard(by: 1)
-            case .down:
-                expandedID = items.first(where: { $0.id == currentID })?.id
-            default:
-                break
-            }
+        switch step {
+        case .previous:
+            moveCurrentCard(by: -1)
+        case .next:
+            moveCurrentCard(by: 1)
+        case .expand:
+            expandedID = items.first(where: { $0.id == currentID })?.id
         }
-    #else
-        /// iPadOS: horizontal swipe moves between cards, swipe up expands the current one.
-        private func handleSwipe(_ value: DragGesture.Value) {
-            guard expandedID == nil else { return }
-
-            let horizontal = value.translation.width
-            let vertical = value.translation.height
-            if abs(horizontal) > abs(vertical) {
-                moveCurrentCard(by: horizontal < 0 ? 1 : -1)
-            } else if vertical < 0 {
-                expandedID = items.first(where: { $0.id == currentID })?.id
-            }
-        }
-    #endif
+    }
 
     private static func imageAlignment(for distance: Int) -> HorizontalAlignment {
         if distance < 0 {
@@ -406,4 +382,45 @@ private struct CarouselCard: View {
     }
 
     @Environment(GamesViewModel.self) var viewModel
+}
+
+private enum CarouselStep {
+    case previous
+    case next
+    case expand
+}
+
+private extension View {
+    /// tvOS: Siri Remote / D-pad moves (down expands). iPadOS: horizontal swipes
+    /// move between cards and a swipe up expands the current one.
+    @ViewBuilder
+    func carouselDirectionalInput(perform action: @escaping (CarouselStep) -> Void) -> some View {
+        #if os(tvOS)
+            onMoveCommand { direction in
+                switch direction {
+                case .left:
+                    action(.previous)
+                case .right:
+                    action(.next)
+                case .down:
+                    action(.expand)
+                default:
+                    break
+                }
+            }
+        #else
+            simultaneousGesture(
+                DragGesture(minimumDistance: 40)
+                    .onEnded { value in
+                        let horizontal = value.translation.width
+                        let vertical = value.translation.height
+                        if abs(horizontal) > abs(vertical) {
+                            action(horizontal < 0 ? .next : .previous)
+                        } else if vertical < 0 {
+                            action(.expand)
+                        }
+                    }
+            )
+        #endif
+    }
 }
