@@ -488,9 +488,9 @@ final class VideoSurfaceView: UIView {
         inputHandler?.sendMouseMove(dx: packetDX, dy: packetDY)
     }
 
-    #if os(iOS)
-        // MARK: - iPadOS system pointer (Universal Control, trackpad)
+    // MARK: - iPadOS system pointer (Universal Control, trackpad)
 
+    #if os(iOS)
         /// Pointer input that is not a GameController mouse: the Mac's keyboard and
         /// trackpad through Universal Control, or a trackpad. Converted to the same
         /// relative moves as GCMouse. Skipped while a GCMouse is connected, which
