@@ -20,7 +20,7 @@ struct GlassPauseMenuTests {
 
         #if os(iOS)
             #expect(normalized.chromaFormat == .yuv420)
-            #expect(normalized.maxBitrateKbps == 50_000)
+            #expect(normalized.maxBitrateKbps == 50000)
             #expect(normalized.deviceTuningVersion == 1)
             // A user who raises the settings afterwards keeps their choice.
             var raised = normalized

@@ -133,7 +133,7 @@ nonisolated struct StreamSettings: Codable, Equatable {
             // the user can raise them again in Settings.
             if normalized.deviceTuningVersion == nil {
                 normalized.chromaFormat = .yuv420
-                normalized.maxBitrateKbps = min(normalized.maxBitrateKbps, 50_000)
+                normalized.maxBitrateKbps = min(normalized.maxBitrateKbps, 50000)
                 normalized.adaptiveFramePacing = true
                 normalized.deviceTuningVersion = 1
             }
