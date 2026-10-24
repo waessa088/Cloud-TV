@@ -109,7 +109,7 @@ struct HandoffTests {
 
     @Test("F01-E2 Forgetting a handed-off lease never schedules a server End")
     @MainActor
-    func releasedLeaseIsForgottenNotParked() async throws {
+    func releasedLeaseIsForgottenNotParked() throws {
         let coordinator = CloudSessionCoordinator()
         let lease = try coordinator.reserveServerSession(
             provider: .geForceNow,
