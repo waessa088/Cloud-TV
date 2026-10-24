@@ -47,3 +47,19 @@ Légende : ✅ automatisé (CI) · 🖐 à vérifier à la main sur tes appareil
 | --- | --- | --- |
 | F03-H1 | suite de tests CloudNow d'origine (tvOS) | ⏳ CI « Tests » |
 | F03-H2 | lancement d'un jeu en 4K HDR (selon abonnement) | 🖐 |
+
+## F04 — Garder la manette (relais iPad → Apple TV)
+
+| cas | description | comment |
+| --- | --- | --- |
+| F04-H1 | un paquet de manette se code et se décode à l'identique | ✅ `packetRoundTrip` |
+| F04-H2 | la TV n'accepte que le jeton convenu lors de la bascule | ✅ `inboxAcceptsTokenHolder` |
+| F04-H3 | le message de bascule transporte le jeton et la demande de libération | ✅ `handoffMessageRelayFields` |
+| F04-H4 | après « Envoyer sur l'Apple TV », la manette de l'iPad pilote le jeu sur la TV sans réappairage | 🖐 |
+| F04-H5 | bouton Home de la manette → menu pause sur la TV | 🖐 |
+| F04-H6 | « Reprendre sur l'iPad » depuis l'écran de relais : la TV lâche la partie, l'iPad la reprend | 🖐 |
+| F04-N1 | paquet tronqué ou mauvais en-tête refusé | ✅ `rejectsMalformedPackets` |
+| F04-N2 | autre jeton, ou aucune session → ignoré | ✅ `inboxRejectsStrangers` |
+| F04-E1 | paquets en désordre ou dupliqués ignorés | ✅ `inboxDropsOldSequences` |
+| F04-E2 | relais coupé (iPad en veille) → manette neutre, aucun bouton bloqué | ✅ `inboxGoesStale` |
+| F04-E3 | fin de session → plus rien n'est accepté | ✅ `inboxEndSession` |
