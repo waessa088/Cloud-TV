@@ -2,7 +2,7 @@ import Foundation
 
 enum L10nES {
     static let strings: [String: String] = [
-        "app_name": "CloudNow",
+        "app_name": "Nimbus",
         "app_tagline": "Juego en la nube para Apple TV",
         "sign_in_with_nvidia": "Iniciar sesión",
         "requires_geforce_now_account": "Requiere una cuenta de juego en la nube",

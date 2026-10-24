@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Cloud TV finds your other devices on the local network to move a game between iPad and Apple TV.</string>
+	<string>Nimbus finds your other devices on the local network to move a game between iPad and Apple TV.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_cloudtv._tcp</string>

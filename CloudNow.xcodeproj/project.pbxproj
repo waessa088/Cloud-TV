@@ -424,7 +424,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = CloudNow/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "Cloud TV";
+				INFOPLIST_KEY_CFBundleDisplayName = Nimbus;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.games";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "CloudNow uses the microphone for voice chat during game sessions.";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -473,7 +473,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = CloudNow/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "Cloud TV";
+				INFOPLIST_KEY_CFBundleDisplayName = Nimbus;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.games";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "CloudNow uses the microphone for voice chat during game sessions.";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

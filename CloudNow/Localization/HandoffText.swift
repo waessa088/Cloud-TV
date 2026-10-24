@@ -22,8 +22,8 @@ enum HandoffText {
 
     static var failed: String {
         isFrench
-            ? "Appareil injoignable. Vérifiez qu’il est allumé, sur le même Wi-Fi, et que Cloud TV y est ouvert."
-            : "Device unreachable. Check that it is on, on the same Wi-Fi, and has Cloud TV open."
+            ? "Appareil injoignable. Vérifiez qu’il est allumé, sur le même Wi-Fi, et que Nimbus y est ouvert."
+            : "Device unreachable. Check that it is on, on the same Wi-Fi, and has Nimbus open."
     }
 
     static func receiving(_ title: String) -> String {
@@ -42,8 +42,8 @@ enum HandoffText {
 
     static func relayDetail(controller: String) -> String {
         isFrench
-            ? "\(controller) reste connectée à l’iPad et pilote l’Apple TV. Garde Cloud TV ouvert ici."
-            : "\(controller) stays paired to this iPad and drives the Apple TV. Keep Cloud TV open here."
+            ? "\(controller) reste connectée à l’iPad et pilote l’Apple TV. Garde Nimbus ouvert ici."
+            : "\(controller) stays paired to this iPad and drives the Apple TV. Keep Nimbus open here."
     }
 
     static var relayMenuHint: String {
@@ -58,5 +58,14 @@ enum HandoffText {
 
     static var stopRelay: String {
         isFrench ? "Arrêter le relais de la manette" : "Stop relaying the controller"
+    }
+
+    static func deviceName(_ kind: HandoffDeviceKind) -> String {
+        switch kind {
+        case .appleTV:
+            "Apple TV"
+        case .iPad:
+            "iPad"
+        }
     }
 }

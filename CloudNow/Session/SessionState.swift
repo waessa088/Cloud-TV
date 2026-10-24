@@ -34,6 +34,8 @@ nonisolated struct StreamSettings: Codable, Equatable {
     var gameLanguage: String = Self.defaultGameLanguage
     var enableL4S: Bool = true
     var adaptiveFramePacing: Bool = false
+    /// Set once the iPad-specific stream tuning below has been applied.
+    var deviceTuningVersion: Int?
     var micEnabled: Bool = false
     var rumbleEnabled: Bool = true
     /// Rumble power multiplier (0.0–2.0, 1.0 = default). Higher values stress controller motors.
@@ -125,6 +127,17 @@ nonisolated struct StreamSettings: Codable, Equatable {
         if normalized.serverRoutingMode == .region, normalized.preferredRegionAddress == nil {
             normalized.serverRoutingMode = .serverAuto
         }
+        #if os(iOS)
+            // The defaults are tuned for a wired Apple TV. On an iPad over Wi-Fi,
+            // 4:4:4 chroma at 100 Mbps stutters, so apply lighter settings once;
+            // the user can raise them again in Settings.
+            if normalized.deviceTuningVersion == nil {
+                normalized.chromaFormat = .yuv420
+                normalized.maxBitrateKbps = min(normalized.maxBitrateKbps, 50_000)
+                normalized.adaptiveFramePacing = true
+                normalized.deviceTuningVersion = 1
+            }
+        #endif
         normalized.normalizeTextInputTriggerSequence()
         return normalized
     }
@@ -170,6 +183,7 @@ extension StreamSettings {
         case sessionEndWarningMinutes
         case audioFormat
         case colorQuality
+        case deviceTuningVersion
     }
 
     nonisolated init(from decoder: Decoder) throws {
@@ -195,6 +209,7 @@ extension StreamSettings {
         gameLanguage = try c.decodeIfPresent(String.self, forKey: .gameLanguage) ?? d.gameLanguage
         enableL4S = try c.decodeIfPresent(Bool.self, forKey: .enableL4S) ?? d.enableL4S
         adaptiveFramePacing = try c.decodeIfPresent(Bool.self, forKey: .adaptiveFramePacing) ?? d.adaptiveFramePacing
+        deviceTuningVersion = try c.decodeIfPresent(Int.self, forKey: .deviceTuningVersion)
         micEnabled = try c.decodeIfPresent(Bool.self, forKey: .micEnabled) ?? d.micEnabled
         rumbleEnabled = try c.decodeIfPresent(Bool.self, forKey: .rumbleEnabled) ?? d.rumbleEnabled
         let storedRumbleIntensity = try c.decodeIfPresent(
@@ -301,6 +316,7 @@ extension StreamSettings {
         try c.encode(persistInGameSettings, forKey: .persistInGameSettings)
         try c.encode(sessionEndWarningMinutes, forKey: .sessionEndWarningMinutes)
         try c.encode(audioFormat, forKey: .audioFormat)
+        try c.encodeIfPresent(deviceTuningVersion, forKey: .deviceTuningVersion)
     }
 }
 

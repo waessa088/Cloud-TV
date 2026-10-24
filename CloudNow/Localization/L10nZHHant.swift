@@ -2,7 +2,7 @@ import Foundation
 
 enum L10nZHHant {
     static let strings: [String: String] = [
-        "app_name": "CloudNow",
+        "app_name": "Nimbus",
         "choose_cloud_gaming_service": "選擇您的雲端遊戲服務",
         "accounts_stay_signed_in_when_switching_services": "切換服務時，各帳戶會保持獨立並維持登入狀態。",
         "awaiting_official_xbox_cloud_support": "正在等候 Xbox Cloud 官方支援",

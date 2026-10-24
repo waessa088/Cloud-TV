@@ -412,7 +412,7 @@ struct StreamView: View {
                 ZStack {
                     if overlayState == .pauseMenu {
                         pauseMenu
-                            .transition(.move(edge: .leading).combined(with: .opacity))
+                            .transition(.opacity.combined(with: .scale(scale: 1.02)))
                     }
 
                     #if os(iOS)
@@ -489,8 +489,27 @@ struct StreamView: View {
     /// Left sidebar, like the official client's in-game overlay. Stats live in the
     /// StatsHUDView on the right, which stays visible while this menu is open.
     private var pauseMenu: some View {
-        CloudStreamPauseMenu(
-            statsMode: streamController.statsMode,
+        GlassPauseMenu(
+            gameTitle: game.title,
+            stats: streamController.stats,
+            remainingMinutes: viewModel.subscription.flatMap { sub in
+                sub.isUnlimited ? nil : sub.remainingMinutes
+            },
+            statsModeLabel: streamController.statsMode.label,
+            handoffTargets: HandoffService.shared.targets.map { peer in
+                GlassPauseMenu.HandoffTarget(
+                    id: peer.id,
+                    title: HandoffText.sendTo(peer.kind),
+                    subtitle: HandoffText.deviceName(peer.kind),
+                    systemImage: peer.kind == .appleTV ? "appletv" : "ipad.landscape",
+                    isBusy: isHandingOff || createdSession == nil,
+                    action: { handOff(to: peer) }
+                )
+            },
+            handoffError: handoffError,
+            remoteModeLabel: Self.showsRemoteModeControl ? remoteModeLabel : nil,
+            remoteModeIcon: remoteModeIcon,
+            isEndDisabled: isEndingSession,
             onResume: closeOverlay,
             onCycleStatistics: {
                 let next = streamController.statsMode.nextHUDLevel
@@ -498,45 +517,19 @@ struct StreamView: View {
                 viewModel.streamSettings.statsMode = next
                 viewModel.saveSettings()
             },
+            onToggleRemoteMode: { streamController.toggleRemoteMode() },
             onLeave: leave,
-            onEndRequest: {
-                showExitConfirmation = true
-            },
-            isEndDisabled: isEndingSession,
-            providerActions: {
-                Button {
-                    streamController.toggleRemoteMode()
-                } label: {
-                    Label(remoteModeLabel, systemImage: remoteModeIcon)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .buttonStyle(.bordered)
-
-                handoffButtons
-            },
-            footer: {
-                if let sub = viewModel.subscription,
-                   !sub.isUnlimited,
-                   let rem = sub.remainingMinutes
-                {
-                    Label {
-                        Text(
-                            rem >= 60
-                                ? "\(rem / 60)h \(rem % 60)m remaining"
-                                : "\(rem)m remaining"
-                        )
-                    } icon: {
-                        Image(systemName: "clock")
-                    }
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(
-                        rem < 30
-                            ? .orange
-                            : hostPrimaryForegroundColor.opacity(0.8)
-                    )
-                }
-            }
+            onEndRequest: { showExitConfirmation = true }
         )
+    }
+
+    /// The Siri Remote input mode only matters on Apple TV.
+    private static var showsRemoteModeControl: Bool {
+        #if os(tvOS)
+            true
+        #else
+            false
+        #endif
     }
 
     private var remoteModeLabel: String {
@@ -552,31 +545,6 @@ struct StreamView: View {
     }
 
     // MARK: Handoff
-
-    /// One button per Cloud TV device of the other kind on the network.
-    @ViewBuilder
-    private var handoffButtons: some View {
-        ForEach(HandoffService.shared.targets) { peer in
-            Button {
-                handOff(to: peer)
-            } label: {
-                Label(
-                    isHandingOff ? HandoffText.sending : HandoffText.sendTo(peer.kind),
-                    systemImage: peer.kind == .appleTV ? "appletv.fill" : "ipad.landscape"
-                )
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.bordered)
-            .tint(.blue)
-            .disabled(isHandingOff || createdSession == nil)
-            .accessibilityIdentifier("stream.handoff.\(peer.kind.rawValue)")
-        }
-        if let handoffError {
-            Text(handoffError)
-                .font(.caption)
-                .foregroundStyle(.orange)
-        }
-    }
 
     #if os(iOS)
         /// iPad has no Menu button: a small corner button opens the pause menu.

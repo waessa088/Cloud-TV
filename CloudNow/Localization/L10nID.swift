@@ -2,7 +2,7 @@ import Foundation
 
 enum L10nID {
     static let strings: [String: String] = [
-        "app_name": "CloudNow",
+        "app_name": "Nimbus",
         "app_tagline": "Cloud gaming untuk Apple TV",
         "sign_in_with_nvidia": "Masuk",
         "requires_geforce_now_account": "Memerlukan akun cloud gaming",
