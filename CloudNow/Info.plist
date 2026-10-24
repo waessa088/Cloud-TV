@@ -2,6 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Cloud TV finds your other devices on the local network to move a game between iPad and Apple TV.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_cloudtv._tcp</string>
+	</array>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>TVTopShelfImage</key>

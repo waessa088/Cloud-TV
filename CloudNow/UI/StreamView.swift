@@ -67,6 +67,8 @@ struct StreamView: View {
     @State private var serverSessionLease: CloudServerSessionLease?
     @State private var localPeerLease: CloudLocalPeerLease?
     @State private var isEndingSession = false
+    @State private var isHandingOff = false
+    @State private var handoffError: String?
     /// Per-ad state tracking to avoid duplicate reports
     @State private var adReportedAction: [String: AdAction] = [:]
 
@@ -407,6 +409,12 @@ struct StreamView: View {
                             .transition(.move(edge: .leading).combined(with: .opacity))
                     }
 
+                    #if os(iOS)
+                        if overlayState == .none {
+                            touchPauseButton
+                        }
+                    #endif
+
                     if overlayState == .textEntry {
                         ControllerTextEntryOverlay(
                             streamController: streamController,
@@ -497,6 +505,8 @@ struct StreamView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .buttonStyle(.bordered)
+
+                handoffButtons
             },
             footer: {
                 if let sub = viewModel.subscription,
@@ -533,6 +543,91 @@ struct StreamView: View {
         case .dualsense: "hand.point.up.left"
         case .gamepadMouse: "cursorarrow.click"
         }
+    }
+
+    // MARK: Handoff
+
+    /// One button per Cloud TV device of the other kind on the network.
+    @ViewBuilder
+    private var handoffButtons: some View {
+        ForEach(HandoffService.shared.targets) { peer in
+            Button {
+                handOff(to: peer)
+            } label: {
+                Label(
+                    isHandingOff ? HandoffText.sending : HandoffText.sendTo(peer.kind),
+                    systemImage: peer.kind == .appleTV ? "appletv.fill" : "ipad.landscape"
+                )
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+            .tint(.blue)
+            .disabled(isHandingOff || createdSession == nil)
+            .accessibilityIdentifier("stream.handoff.\(peer.kind.rawValue)")
+        }
+        if let handoffError {
+            Text(handoffError)
+                .font(.caption)
+                .foregroundStyle(.orange)
+        }
+    }
+
+    #if os(iOS)
+        /// iPad has no Menu button: a small corner button opens the pause menu.
+        private var touchPauseButton: some View {
+            Button {
+                togglePauseMenu()
+            } label: {
+                Image(systemName: "pause.circle.fill")
+                    .font(.system(size: 34))
+                    .foregroundStyle(.white.opacity(0.55))
+                    .padding(14)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .accessibilityLabel(L10n.text("resume"))
+            .accessibilityIdentifier("stream.touch-pause")
+        }
+    #endif
+
+    /// Sends the running session to `peer`, then lets go of it locally without
+    /// ending it on the server, so the other device can claim it.
+    private func handOff(to peer: HandoffPeer) {
+        guard !isHandingOff, let session = createdSession else { return }
+        isHandingOff = true
+        handoffError = nil
+        let message = HandoffMessage(
+            game: game,
+            sessionId: session.sessionId,
+            appId: existingSession?.appId ?? game.variants.first?.appId ?? game.variants.first?.id,
+            serverIp: session.serverIp,
+            signalingUrl: session.signalingUrl
+        )
+        Task {
+            let delivered = await HandoffService.shared.send(message, to: peer)
+            isHandingOff = false
+            guard delivered else {
+                handoffError = HandoffText.failed
+                return
+            }
+            releaseSessionForHandoff()
+        }
+    }
+
+    /// Like Leave, but the lease is forgotten instead of parked: a parked lease
+    /// would End the server session when it expires, killing the stream that is
+    /// now running on the other device.
+    private func releaseSessionForHandoff() {
+        if let serverSessionLease {
+            cloudSessionCoordinator.endServerSession(serverSessionLease)
+        }
+        serverSessionLease = nil
+        releaseLocalPeerLease()
+        sessionOrchestrator.detachOwnedSession()
+        cancelSessionAttempt()
+        streamController.disconnect()
+        onDismiss()
     }
 
     // MARK: Time Warning Banner

@@ -11,6 +11,7 @@ struct MainTabView: View {
     @State private var directSessionToResume: SessionInfo? = nil
     @State private var selectedTab: AppTab = .home
     @State private var controllerNavigation = UIControllerNavigationCoordinator()
+    @State private var handoffStatus: String?
     private let loadsRemoteData: Bool
 
     init(
@@ -64,6 +65,7 @@ struct MainTabView: View {
         .environment(viewModel)
         .task {
             guard loadsRemoteData else { return }
+            HandoffService.shared.start()
             await viewModel.load(authManager: authManager)
             viewModel.restoreResumableSession(
                 from: cloudSessionCoordinator.serverSession
@@ -79,6 +81,24 @@ struct MainTabView: View {
         .onDisappear {
             viewModel.cancelForegroundLibraryRefresh()
         }
+        .onChange(of: HandoffService.shared.incoming?.sessionId) { _, sessionId in
+            guard sessionId != nil, let message = HandoffService.shared.incoming else { return }
+            HandoffService.shared.incoming = nil
+            Task { await receiveHandoff(message) }
+        }
+        .overlay(alignment: .top) {
+            if let handoffStatus {
+                Label(handoffStatus, systemImage: "arrow.left.arrow.right")
+                    .font(.headline)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 14)
+                    .background(.ultraThinMaterial, in: .capsule)
+                    .padding(.top, 40)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .accessibilityIdentifier("handoff-status")
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: handoffStatus)
         .onChange(of: viewModel.streamSettings) { viewModel.saveSettings() }
         .onChange(of: gameToPlay) { _, new in
             if new == nil {
@@ -112,6 +132,35 @@ struct MainTabView: View {
             .blocksGlobalControllerNavigation(mode: .streaming)
             .environment(controllerNavigation)
         }
+    }
+}
+
+extension MainTabView {
+    /// Picks up a session another Cloud TV device just let go of. The session
+    /// keeps running at NVIDIA; this device claims it like any session started
+    /// elsewhere on the same account.
+    private func receiveHandoff(_ message: HandoffMessage) async {
+        guard loadsRemoteData, gameToPlay == nil else { return }
+        handoffStatus = HandoffText.receiving(message.game.title)
+        defer { handoffStatus = nil }
+
+        // Give the sender a moment to drop its connection, then prefer the
+        // server's own view of the session (fresh server address) when listed.
+        var session = message.activeSessionInfo
+        for _ in 0 ..< 4 {
+            try? await Task.sleep(for: .seconds(1.5))
+            await viewModel.refreshActiveSessions(authManager: authManager)
+            if let listed = viewModel.activeSessions.first(where: { $0.sessionId == message.sessionId }),
+               listed.serverIp != nil
+            {
+                session = listed
+                break
+            }
+        }
+        guard gameToPlay == nil else { return }
+        directSessionToResume = nil
+        sessionToResume = session
+        gameToPlay = message.game
     }
 }
 
