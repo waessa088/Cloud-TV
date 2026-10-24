@@ -17,7 +17,9 @@ jobs:
         github.event.workflow_run.event == 'push' &&
         github.event.workflow_run.head_repository.full_name == github.repository
       }}
-    runs-on: macos-latest
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
 
     steps:
       - name: Checkout
@@ -26,11 +28,6 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.workflow_run.head_sha }}
 
-      - name: Select Xcode
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: latest
-
       - name: Resolve SPM dependencies
         run: |
           xcodebuild -resolvePackageDependencies \
@@ -38,26 +35,41 @@ jobs:
             -scheme CloudNow \
             -clonedSourcePackagesDirPath .spm-packages
 
-      - name: Archive
+      - name: Archive tvOS
         run: |
           xcodebuild archive \
             -project CloudNow.xcodeproj \
             -scheme CloudNow \
             -configuration Release \
             -destination "generic/platform=tvOS" \
-            -archivePath "$RUNNER_TEMP/CloudNow.xcarchive" \
+            -archivePath "$RUNNER_TEMP/tvOS.xcarchive" \
             -clonedSourcePackagesDirPath .spm-packages \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
-      - name: Package IPA
+      - name: Archive iPadOS
         run: |
-          mkdir -p "$RUNNER_TEMP/Payload"
-          cp -r "$RUNNER_TEMP/CloudNow.xcarchive/Products/Applications/CloudNow.app" \
-            "$RUNNER_TEMP/Payload/"
+          xcodebuild archive \
+            -project CloudNow.xcodeproj \
+            -scheme CloudNow \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/iPadOS.xcarchive" \
+            -clonedSourcePackagesDirPath .spm-packages \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package IPAs
+        run: |
           cd "$RUNNER_TEMP"
-          zip -r CloudNow.ipa Payload/
+          for platform in tvOS iPadOS; do
+            rm -rf Payload
+            mkdir Payload
+            cp -r "$platform.xcarchive/Products/Applications/CloudNow.app" Payload/
+            zip -qr "CloudTV-$platform.ipa" Payload/
+          done
 
       - name: Generate release tag
         id: tag
@@ -65,12 +77,14 @@ jobs:
           SHORT_SHA=$(git rev-parse --short HEAD)
           TAG="v$(date +%Y.%m.%d)-${SHORT_SHA}"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "name=CloudNow ${TAG}" >> "$GITHUB_OUTPUT"
+          echo "name=Cloud TV ${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.name }}
-          files: ${{ runner.temp }}/CloudNow.ipa
+          files: |
+            ${{ runner.temp }}/CloudTV-tvOS.ipa
+            ${{ runner.temp }}/CloudTV-iPadOS.ipa
           generate_release_notes: true
