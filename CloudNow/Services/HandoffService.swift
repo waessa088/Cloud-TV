@@ -341,7 +341,7 @@ final class HandoffService {
 }
 
 /// Resumes a checked continuation exactly once across racing callbacks.
-private nonisolated final class ResumeOnce: @unchecked Sendable {
+private final nonisolated class ResumeOnce: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Bool, Never>?
 
