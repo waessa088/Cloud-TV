@@ -99,6 +99,22 @@ struct MainTabView: View {
             }
         }
         .animation(.easeInOut(duration: 0.25), value: handoffStatus)
+        .overlay {
+            if let relay = HandoffService.shared.relay {
+                HandoffRelayView(
+                    relay: relay,
+                    onResumeHere: {
+                        Task {
+                            if let message = await HandoffService.shared.takeBackRelayedGame() {
+                                await receiveHandoff(message)
+                            }
+                        }
+                    },
+                    onStop: { HandoffService.shared.stopRelay() }
+                )
+                .transition(.opacity)
+            }
+        }
         .onChange(of: viewModel.streamSettings) { viewModel.saveSettings() }
         .onChange(of: gameToPlay) { _, new in
             if new == nil {
@@ -140,15 +156,20 @@ extension MainTabView {
     /// keeps running at NVIDIA; this device claims it like any session started
     /// elsewhere on the same account.
     private func receiveHandoff(_ message: HandoffMessage) async {
-        guard loadsRemoteData, gameToPlay == nil else { return }
+        guard loadsRemoteData else { return }
+        // Taking the game back from the TV ends this iPad's controller relay.
+        HandoffService.shared.stopRelay()
+        guard gameToPlay == nil else { return }
         handoffStatus = HandoffText.receiving(message.game.title)
         defer { handoffStatus = nil }
 
-        // Give the sender a moment to drop its connection, then look the
-        // session up in NVIDIA's own list. Never use an address from the peer.
+        // Look the session up in NVIDIA's own list right away, then retry
+        // briefly while the sender lets go. Never use an address from the peer.
         var listed: ActiveSessionInfo?
-        for _ in 0 ..< 8 {
-            try? await Task.sleep(for: .seconds(1.5))
+        for attempt in 0 ..< 12 {
+            if attempt > 0 {
+                try? await Task.sleep(for: .milliseconds(750))
+            }
             await viewModel.refreshActiveSessions(authManager: authManager)
             listed = message.matchingSession(in: viewModel.activeSessions)
             if listed != nil {

@@ -181,6 +181,11 @@ struct StreamView: View {
         .onChange(of: streamController.textEntryRequestCount) { _, _ in
             presentControllerTextEntry()
         }
+        .onChange(of: HandoffService.shared.releaseRequestedSessionId) { _, sessionId in
+            guard let sessionId, sessionId == createdSession?.sessionId else { return }
+            HandoffService.shared.releaseRequestedSessionId = nil
+            releaseSessionForHandoff()
+        }
         .tvExitCommand {
             if overlayState == .textEntry {
                 cancelControllerTextEntry()
@@ -194,6 +199,7 @@ struct StreamView: View {
             guard streamController.state == .streaming else { return }
             togglePauseMenu()
         }
+        .immersiveOnIPad()
     }
 
     // MARK: Connecting
@@ -579,9 +585,11 @@ struct StreamView: View {
                 togglePauseMenu()
             } label: {
                 Image(systemName: "pause.circle.fill")
-                    .font(.system(size: 34))
-                    .foregroundStyle(.white.opacity(0.55))
-                    .padding(14)
+                    .font(.system(size: 30))
+                    .foregroundStyle(.white.opacity(0.35))
+                    .padding(.leading, 28)
+                    .padding(.top, 24)
+                    .padding(12)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -597,19 +605,38 @@ struct StreamView: View {
         guard !isHandingOff, let session = createdSession else { return }
         isHandingOff = true
         handoffError = nil
+        let handoff = HandoffService.shared
+        // iPad → Apple TV: keep the controller here and relay it, so it never
+        // has to be re-paired. The TV's own controllers keep working too.
+        let relayToken: UInt64? = HandoffDeviceKind.current == .iPad
+            && peer.kind == .appleTV
+            && handoff.relayableController != nil
+            ? UInt64.random(in: 1 ... UInt64.max)
+            : nil
+        let appId = existingSession?.appId ?? game.variants.first?.appId ?? game.variants.first?.id
         let message = HandoffMessage(
             game: game,
             sessionId: session.sessionId,
-            appId: existingSession?.appId ?? game.variants.first?.appId ?? game.variants.first?.id
+            appId: appId,
+            relayToken: relayToken
         )
         Task {
-            let delivered = await HandoffService.shared.send(message, to: peer)
+            let delivered = await handoff.send(message, to: peer)
             isHandingOff = false
             guard delivered else {
                 handoffError = HandoffText.failed
                 return
             }
             releaseSessionForHandoff()
+            if let relayToken {
+                handoff.startRelay(
+                    token: relayToken,
+                    to: peer,
+                    game: game,
+                    sessionId: session.sessionId,
+                    appId: appId
+                )
+            }
         }
     }
 

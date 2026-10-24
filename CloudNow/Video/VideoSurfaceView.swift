@@ -264,7 +264,13 @@ final class VideoSurfaceView: UIView {
 
     private func setup() {
         backgroundColor = .black
-        displayLayer.videoGravity = .resizeAspectFill
+        #if os(tvOS)
+            displayLayer.videoGravity = .resizeAspectFill
+        #else
+            // iPad screens are not 16:9: fill would crop the sides of the game,
+            // so show the whole frame and letterbox the remainder.
+            displayLayer.videoGravity = .resizeAspect
+        #endif
         displayLayer.controlTimebase = nil
 
         let sampleBufferRenderer = displayLayer.sampleBufferRenderer
@@ -940,7 +946,47 @@ final class StreamingViewController: GCEventViewController {
         controllerUserInteractionEnabled = false
         view = videoSurface
     }
+
+    #if os(iOS)
+        /// iPadOS: during gameplay the mouse drives the game's own cursor through
+        /// GCMouse deltas, so the system pointer is locked and hidden. While the
+        /// pause menu is open the pointer comes back to click its buttons.
+        var capturesPointer = true {
+            didSet {
+                guard capturesPointer != oldValue else { return }
+                setNeedsUpdateOfPrefersPointerLocked()
+                pointerInteraction.invalidate()
+            }
+        }
+
+        private lazy var pointerInteraction = UIPointerInteraction(delegate: self)
+
+        override var prefersPointerLocked: Bool {
+            capturesPointer
+        }
+
+        override func viewDidLoad() {
+            super.viewDidLoad()
+            videoSurface.addInteraction(pointerInteraction)
+        }
+
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            setNeedsUpdateOfPrefersPointerLocked()
+        }
+    #endif
 }
+
+#if os(iOS)
+    extension StreamingViewController: UIPointerInteractionDelegate {
+        func pointerInteraction(
+            _: UIPointerInteraction,
+            styleFor _: UIPointerRegion
+        ) -> UIPointerStyle? {
+            capturesPointer ? .hidden() : nil
+        }
+    }
+#endif
 
 // MARK: - SwiftUI Wrapper
 
@@ -965,6 +1011,9 @@ struct VideoSurfaceViewRepresentable: UIViewControllerRepresentable {
         // while the overlay is visible so SwiftUI focus navigation works there.
         vc.controllerUserInteractionEnabled = showOverlay
         vc.videoSurface.overlayVisible = showOverlay
+        #if os(iOS)
+            vc.capturesPointer = !showOverlay
+        #endif
     }
 
     static func dismantleUIViewController(_ vc: StreamingViewController, coordinator _: ()) {

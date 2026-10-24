@@ -45,4 +45,15 @@ extension View {
             buttonStyle(.plain)
         #endif
     }
+
+    /// iPadOS: hides the status bar and the Home indicator (no-op on tvOS).
+    @ViewBuilder
+    func immersiveOnIPad() -> some View {
+        #if os(iOS)
+            statusBarHidden(true)
+                .persistentSystemOverlays(.hidden)
+        #else
+            self
+        #endif
+    }
 }

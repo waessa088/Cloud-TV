@@ -1,5 +1,9 @@
 import Foundation
+import GameController
 import Network
+#if canImport(UIKit)
+    import UIKit
+#endif
 import os.log
 
 private let handoffLog = Logger(subsystem: "com.waessa.CloudTV", category: "Handoff")
@@ -44,11 +48,18 @@ nonisolated struct HandoffMessage: Codable {
     let game: GameInfo
     let sessionId: String
     let appId: String?
+    /// Present when the sender keeps the controller and relays it (hex UInt64).
+    let relayToken: String?
+    /// When true the sender takes the session back: the receiver should let go
+    /// of it (without ending it) instead of resuming it.
+    let release: Bool?
 
     init(
         game: GameInfo,
         sessionId: String,
         appId: String?,
+        relayToken: UInt64? = nil,
+        release: Bool = false,
         senderKind: HandoffDeviceKind = .current
     ) {
         version = Self.currentVersion
@@ -56,6 +67,17 @@ nonisolated struct HandoffMessage: Codable {
         self.game = game
         self.sessionId = sessionId
         self.appId = appId
+        self.relayToken = relayToken.map { String($0, radix: 16) }
+        self.release = release ? true : nil
+    }
+
+    var isRelease: Bool {
+        release == true
+    }
+
+    /// The relay token, when the sender relays its controller.
+    var relayTokenValue: UInt64? {
+        relayToken.flatMap { UInt64($0, radix: 16) }
     }
 
     func encoded() throws -> Data {
@@ -94,6 +116,21 @@ final class HandoffService {
     private(set) var peers: [HandoffPeer] = []
     /// A session another device asked this one to resume. Consumers clear it.
     var incoming: HandoffMessage?
+    /// Set on the iPad while its controller drives a game on the Apple TV.
+    private(set) var relay: RelayState?
+    /// A session another device is taking back; the player streaming it lets go.
+    var releaseRequestedSessionId: String?
+
+    struct RelayState {
+        let peer: HandoffPeer
+        let game: GameInfo
+        let sessionId: String
+        let appId: String?
+        let controllerName: String
+    }
+
+    @ObservationIgnored private var relaySender: RemoteGamepadSender?
+    @ObservationIgnored private var relayReceiver: RemoteGamepadReceiver?
 
     @ObservationIgnored private let instanceName = "CloudTV-\(UUID().uuidString.prefix(8))"
     @ObservationIgnored private var listener: NWListener?
@@ -116,6 +153,72 @@ final class HandoffService {
         guard listener == nil else { return }
         startListener()
         startBrowser()
+        #if os(tvOS)
+            if relayReceiver == nil {
+                let receiver = RemoteGamepadReceiver()
+                receiver.start(instanceName: instanceName)
+                relayReceiver = receiver
+            }
+        #endif
+    }
+
+    // MARK: - Controller relay
+
+    /// The controller to relay, when one is connected to this device.
+    var relayableController: GCController? {
+        GCController.current?.extendedGamepad != nil
+            ? GCController.current
+            : GCController.controllers().first { $0.extendedGamepad != nil }
+    }
+
+    /// iPad: keeps the local controller and streams it to `peer` after a handoff.
+    func startRelay(token: UInt64, to peer: HandoffPeer, game: GameInfo, sessionId: String, appId: String?) {
+        stopRelay()
+        let sampler = LocalGamepadSampler()
+        let sender = RemoteGamepadSender(toServiceNamed: peer.id, token: token) {
+            sampler.sample()
+        }
+        sender.start()
+        relaySender = sender
+        relay = RelayState(
+            peer: peer,
+            game: game,
+            sessionId: sessionId,
+            appId: appId,
+            controllerName: relayableController?.vendorName ?? "Manette"
+        )
+        setIdleTimerDisabled(true)
+        handoffLog.info("Relaying the controller to \(peer.kind.rawValue, privacy: .public)")
+    }
+
+    /// iPad: takes the relayed game back. Asks the TV to let go first so it
+    /// does not sit on a disconnect screen; resumes here either way.
+    func takeBackRelayedGame() async -> HandoffMessage? {
+        guard let relay else { return nil }
+        stopRelay()
+        let release = HandoffMessage(
+            game: relay.game,
+            sessionId: relay.sessionId,
+            appId: relay.appId,
+            release: true
+        )
+        _ = await send(release, to: relay.peer)
+        return HandoffMessage(game: relay.game, sessionId: relay.sessionId, appId: relay.appId)
+    }
+
+    func stopRelay() {
+        relaySender?.stop()
+        relaySender = nil
+        if relay != nil {
+            relay = nil
+            setIdleTimerDisabled(false)
+        }
+    }
+
+    private func setIdleTimerDisabled(_ disabled: Bool) {
+        #if canImport(UIKit)
+            UIApplication.shared.isIdleTimerDisabled = disabled
+        #endif
     }
 
     func stop() {
@@ -180,6 +283,16 @@ final class HandoffService {
             return
         }
         handoffLog.info("Received a handoff from \(message.senderKind.rawValue, privacy: .public)")
+        if message.isRelease {
+            RemoteGamepadInbox.shared.endSession()
+            releaseRequestedSessionId = message.sessionId
+            return
+        }
+        if let token = message.relayTokenValue {
+            RemoteGamepadInbox.shared.beginSession(token: token)
+        } else {
+            RemoteGamepadInbox.shared.endSession()
+        }
         incoming = message
     }
 
@@ -351,5 +464,45 @@ private final nonisolated class ResumeOnce: @unchecked Sendable {
         guard let pending else { return false }
         pending.resume(returning: value)
         return true
+    }
+}
+
+/// Reads the locally paired controller for the relay. Only touched from the
+/// relay sender's queue. The controller's Home button opens the pause menu on
+/// the receiving device instead of reaching the game.
+final nonisolated class LocalGamepadSampler: @unchecked Sendable {
+    /// XInput Guide bit (GFNInput.guide); Home is used for the pause menu instead.
+    private static let guideButtonMask: UInt16 = 0x0400
+    private var homeWasPressed = false
+    private var menuPresses: UInt8 = 0
+    private var configuredController: ObjectIdentifier?
+
+    func sample() -> RelayedGamepadState? {
+        let controller = GCController.current?.extendedGamepad != nil
+            ? GCController.current
+            : GCController.controllers().first { $0.extendedGamepad != nil }
+        guard let controller, let pad = controller.extendedGamepad else { return nil }
+
+        if configuredController != ObjectIdentifier(controller) {
+            configuredController = ObjectIdentifier(controller)
+            pad.buttonHome?.preferredSystemGestureState = .disabled
+        }
+        let homePressed = pad.buttonHome?.isPressed ?? false
+        if homePressed, !homeWasPressed {
+            menuPresses &+= 1
+        }
+        homeWasPressed = homePressed
+
+        let mapped = mapGCControllerToXInput(controller)
+        return RelayedGamepadState(
+            buttons: mapped.buttons & ~Self.guideButtonMask,
+            leftTrigger: mapped.leftTrigger,
+            rightTrigger: mapped.rightTrigger,
+            leftStickX: mapped.lx,
+            leftStickY: mapped.ly,
+            rightStickX: mapped.rx,
+            rightStickY: mapped.ry,
+            menuPresses: menuPresses
+        )
     }
 }

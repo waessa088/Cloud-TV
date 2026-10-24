@@ -717,6 +717,9 @@ final nonisolated class InputSender: @unchecked Sendable {
     private var steamOverlayGestureEnabled = true
     private var isPaused = false
     private var isRunning = false
+    /// Slot used by a controller relayed from another Cloud TV device.
+    private var relayedSlot: Int?
+    private var lastRelayedMenuPresses: UInt8?
     private var sonyGamepadEnabled = false
     private var sonySlots = Set<Int>()
     private var sonyAttachTokens: [Int: UUID] = [:]
@@ -819,9 +822,63 @@ final nonisolated class InputSender: @unchecked Sendable {
             sonySlots.removeAll()
             sonyAttachTokens.removeAll()
             gamepadBitmap = 0
+            relayedSlot = nil
+            lastRelayedMenuPresses = nil
             lastSnapshots.removeAll()
             lastSnapshotSend.removeAll()
         }
+    }
+
+    // MARK: Relayed controller
+
+    /// Samples a controller relayed from another Cloud TV device (iPad → Apple
+    /// TV handoff). It takes a free slot while fresh state arrives and gives it
+    /// back, after a neutral report, as soon as the relay goes quiet.
+    private func pollRelayedGamepad(now: UInt64) {
+        guard let relayed = RemoteGamepadInbox.shared.current() else {
+            releaseRelayedSlot()
+            return
+        }
+        let slot: Int
+        if let relayedSlot {
+            slot = relayedSlot
+        } else {
+            guard let free = firstFreeSlot else { return }
+            relayedSlot = free
+            lastRelayedMenuPresses = relayed.menuPresses
+            gamepadBitmap |= Self.extendedGamepadBitmapMask(for: free)
+            sendGamepadSnapshot(neutralSnapshot(bitmap: gamepadBitmap), slot: free, force: true)
+            slot = free
+        }
+        if let last = lastRelayedMenuPresses, last != relayed.menuPresses {
+            notifyMenuToggle()
+        }
+        lastRelayedMenuPresses = relayed.menuPresses
+        guard !isPaused else { return }
+        sendGamepadSnapshot(
+            GamepadSnapshot(
+                buttons: relayed.buttons,
+                leftTrigger: relayed.leftTrigger,
+                rightTrigger: relayed.rightTrigger,
+                leftStickX: relayed.leftStickX,
+                leftStickY: relayed.leftStickY,
+                rightStickX: relayed.rightStickX,
+                rightStickY: relayed.rightStickY,
+                bitmap: gamepadBitmap
+            ),
+            slot: slot,
+            now: now
+        )
+    }
+
+    private func releaseRelayedSlot() {
+        guard let slot = relayedSlot else { return }
+        relayedSlot = nil
+        lastRelayedMenuPresses = nil
+        gamepadBitmap &= ~Self.extendedGamepadBitmapMask(for: slot)
+        sendGamepadSnapshot(neutralSnapshot(bitmap: gamepadBitmap), slot: slot, force: true)
+        lastSnapshots[slot] = nil
+        lastSnapshotSend[slot] = nil
     }
 
     func configure(
@@ -986,6 +1043,7 @@ final nonisolated class InputSender: @unchecked Sendable {
             lastHeartbeat = now
             sendEncoded(category: .heartbeat) { encoder.encodeHeartbeat(into: $0) }
         }
+        pollRelayedGamepad(now: now)
         guard !isPaused else { return }
 
         for controller in extendedControllers.sorted(by: { slot(for: $0) < slot(for: $1) }) {
@@ -1001,7 +1059,7 @@ final nonisolated class InputSender: @unchecked Sendable {
         // Siri Remote drives the mouse in gamepadMouse, acts as a fallback gamepad in gamepad
         // when no extended controller is present, and is suppressed in dualsense.
         if let remote = microControllers.first,
-           remoteMode.remoteActsAsMouse || (remoteMode == .gamepad && extendedControllers.isEmpty)
+           remoteMode.remoteActsAsMouse || (remoteMode == .gamepad && extendedControllers.isEmpty && relayedSlot == nil)
         {
             handleMicroGamepad(remote, now: now)
         }
@@ -2050,7 +2108,10 @@ final nonisolated class InputSender: @unchecked Sendable {
     }
 
     private var firstFreeSlot: Int? {
-        let used = Set(controllerSlots.values)
+        var used = Set(controllerSlots.values)
+        if let relayedSlot {
+            used.insert(relayedSlot)
+        }
         return (0 ..< 4).first { !used.contains($0) }
     }
 

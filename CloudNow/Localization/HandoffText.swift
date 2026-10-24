@@ -35,4 +35,28 @@ enum HandoffText {
             ? "Session introuvable. Les deux appareils doivent être connectés au même compte GeForce NOW."
             : "Session not found. Both devices must be signed in to the same GeForce NOW account."
     }
+
+    static var relayTitle: String {
+        isFrench ? "Tu joues sur l’Apple TV" : "Playing on Apple TV"
+    }
+
+    static func relayDetail(controller: String) -> String {
+        isFrench
+            ? "\(controller) reste connectée à l’iPad et pilote l’Apple TV. Garde Cloud TV ouvert ici."
+            : "\(controller) stays paired to this iPad and drives the Apple TV. Keep Cloud TV open here."
+    }
+
+    static var relayMenuHint: String {
+        isFrench
+            ? "Bouton Home de la manette : menu pause sur la TV"
+            : "Controller Home button: pause menu on the TV"
+    }
+
+    static var resumeHere: String {
+        isFrench ? "Reprendre sur l’iPad" : "Continue on iPad"
+    }
+
+    static var stopRelay: String {
+        isFrench ? "Arrêter le relais de la manette" : "Stop relaying the controller"
+    }
 }
