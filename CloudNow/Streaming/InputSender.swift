@@ -1995,6 +1995,11 @@ final nonisolated class InputSender: @unchecked Sendable {
             pad.leftThumbstickButton, pad.rightThumbstickButton,
         ]
         buttons.append(controllerTouchpad(for: controller)?.button)
+        #if os(iOS)
+            // iPadOS: the PS / Xbox / Home button opens the in-stream menu, so
+            // keep the system from taking it (Game Center, app switcher).
+            buttons.append(pad.buttonHome)
+        #endif
         for btn in buttons.compactMap({ $0 }) {
             btn.preferredSystemGestureState = .disabled
         }
@@ -2057,6 +2062,13 @@ final nonisolated class InputSender: @unchecked Sendable {
                     self?.sendControllerTouchpadButton(pressed)
                 }
             }
+            #if os(iOS)
+                pad.buttonHome?.pressedChangedHandler = { [weak self] _, _, pressed in
+                    if pressed {
+                        self?.notifyMenuToggle()
+                    }
+                }
+            #endif
 
             claimControllerInput(controller)
             sendGamepadSnapshot(neutralSnapshot(bitmap: gamepadBitmap), slot: slot, force: true)
@@ -2149,6 +2161,7 @@ final nonisolated class InputSender: @unchecked Sendable {
 
     private func clearControllerHandlers(_ controller: GCController) {
         controller.extendedGamepad?.valueChangedHandler = nil
+        controller.extendedGamepad?.buttonHome?.pressedChangedHandler = nil
         controller.microGamepad?.buttonA.pressedChangedHandler = nil
         (controller.extendedGamepad as? GCDualSenseGamepad)?.touchpadButton.pressedChangedHandler = nil
         (controller.extendedGamepad as? GCDualShockGamepad)?.touchpadButton.pressedChangedHandler = nil

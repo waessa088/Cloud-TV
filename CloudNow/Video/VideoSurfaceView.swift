@@ -322,6 +322,15 @@ final class VideoSurfaceView: UIView {
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
         var handled = false
         for press in presses {
+            #if os(iOS)
+                // iPadOS reports a controller's B / Circle as a Menu press. The
+                // game already receives that button through GameController, and the
+                // menu opens from the PS / Home button, so swallow it here.
+                if press.key == nil, press.type == .menu || press.type == .playPause {
+                    handled = true
+                    continue
+                }
+            #endif
             if press.type == .menu {
                 // Always consume .menu — never let it bubble to the system as a back/dismiss
                 // gesture. Use it as the universal overlay toggle so the user can both open
@@ -354,6 +363,12 @@ final class VideoSurfaceView: UIView {
     override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
         var handled = false
         for press in presses {
+            #if os(iOS)
+                if press.key == nil, press.type == .menu || press.type == .playPause {
+                    handled = true
+                    continue
+                }
+            #endif
             if press.type == .select, remoteSelectMouseDown {
                 inputHandler?.sendMouseButton(down: false, button: 1)
                 remoteSelectMouseDown = false
