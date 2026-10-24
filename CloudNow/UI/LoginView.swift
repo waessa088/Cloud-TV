@@ -168,7 +168,7 @@ struct LoginProviderPrompt<ProviderContent: View>: View {
                         .accessibilityIdentifier("login.choose-service")
                     }
                     .frame(maxWidth: .infinity)
-                    .focusSection()
+                    .tvFocusSection()
                 }
             }
             .padding(.horizontal, 72)
@@ -235,7 +235,7 @@ struct LoginProviderPicker: View {
             }
         }
         .frame(height: Self.railHeight)
-        .focusSection()
+        .tvFocusSection()
         .defaultFocus($focusedProvider, displayedProviders.first?.idpId)
         .accessibilityIdentifier("login-provider-picker")
     }

@@ -415,7 +415,7 @@ struct CloudCatalogFilterBar<SortValue: Hashable, FilterSheet: View>: View {
         }
         .padding(.horizontal, 60)
         .padding(.vertical, 22)
-        .focusSection()
+        .tvFocusSection()
         .fullScreenCover(isPresented: $isShowingFilters) {
             filterSheet($isShowingFilters)
         }
@@ -714,7 +714,7 @@ private struct GameFilterSheet: View {
                 }
             }
         }
-        .onExitCommand(perform: onClose)
+        .tvExitCommand(perform: onClose)
         .blocksGlobalControllerNavigation()
     }
 
@@ -988,7 +988,7 @@ struct FilterOptionButton: View {
                     )
             }
         }
-        .buttonStyle(.card)
+        .tvCardButtonStyle()
         .fixedSize(horizontal: true, vertical: false)
         .disabled(count == 0)
     }

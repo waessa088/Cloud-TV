@@ -64,11 +64,11 @@ struct LibraryRefreshProgressView: View {
                     .padding(.horizontal, 70)
                     .padding(.vertical, 24)
                 }
-                .focusSection()
+                .tvFocusSection()
                 .accessibilityIdentifier("libraryRefreshProgressSheet")
             }
         }
-        .onExitCommand {
+        .tvExitCommand {
             dismissFromHeader()
         }
         .defaultFocus($focusedHeaderControl, defaultHeaderControl)

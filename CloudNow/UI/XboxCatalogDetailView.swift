@@ -106,7 +106,7 @@ struct XboxCatalogDetailView: View {
         }
         .ignoresSafeArea()
         .defaultFocus($focusedElement, preferredFocusTarget)
-        .onExitCommand(perform: onCollapse)
+        .tvExitCommand(perform: onCollapse)
         .fullScreenCover(isPresented: $showFullDescription) {
             if let description = item.longDescription {
                 FullDescriptionView(description: description)
@@ -295,7 +295,7 @@ struct XboxCatalogDetailView: View {
                             .frame(width: 426, height: 240)
                             .clipShape(RoundedRectangle(cornerRadius: 12))
                         }
-                        .buttonStyle(.card)
+                        .tvCardButtonStyle()
                     }
                 }
                 .scrollTargetLayout()
@@ -338,7 +338,7 @@ struct XboxCatalogDetailView: View {
                 .padding(24)
                 .frame(maxWidth: 600, alignment: .leading)
             }
-            .buttonStyle(.card)
+            .tvCardButtonStyle()
             .focused($focusedElement, equals: .about)
         }
     }

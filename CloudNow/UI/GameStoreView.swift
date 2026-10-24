@@ -41,7 +41,7 @@ struct GameStoreView: View {
         .background(.background)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("game-store-qr")
-        .onExitCommand {
+        .tvExitCommand {
             dismiss()
         }
         .blocksGlobalControllerNavigation()

@@ -2088,7 +2088,7 @@ private struct TextInputTriggerSequenceCaptureView: View {
         .navigationTitle("")
         .accessibilityIdentifier("settings.controller.text-input-buttons.page")
         .defaultFocus($focusedControl, .startListening)
-        .onExitCommand {
+        .tvExitCommand {
             if isCapturing {
                 cancelCapture()
             } else {

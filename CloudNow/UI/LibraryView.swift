@@ -330,6 +330,6 @@ struct GameCardView: View {
         Button(action: onPlay) {
             GameCardLabel(game: game)
         }
-        .buttonStyle(.card)
+        .tvCardButtonStyle()
     }
 }

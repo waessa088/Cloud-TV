@@ -321,7 +321,7 @@ struct GameDetailView: View {
             }
         }
         .defaultFocus($focusedElement, preferredFocusTarget)
-        .onExitCommand {
+        .tvExitCommand {
             dismissFullScreen()
         }
         .fullScreenCover(isPresented: $showFullDescription) {
@@ -368,7 +368,7 @@ struct GameDetailView: View {
         }
         .ignoresSafeArea()
         .defaultFocus($focusedElement, preferredFocusTarget)
-        .onExitCommand {
+        .tvExitCommand {
             onCollapse?()
         }
         .fullScreenCover(isPresented: $showFullDescription) {
@@ -657,7 +657,7 @@ struct GameDetailView: View {
                             .frame(width: 426, height: 240)
                             .clipShape(RoundedRectangle(cornerRadius: 12))
                         }
-                        .buttonStyle(.card)
+                        .tvCardButtonStyle()
                     }
                 }
                 .scrollTargetLayout()
@@ -731,7 +731,7 @@ struct GameDetailView: View {
                 .padding(24)
                 .frame(maxWidth: 600, alignment: .leading)
             }
-            .buttonStyle(.card)
+            .tvCardButtonStyle()
             .focused($focusedElement, equals: .about)
         }
     }
@@ -1016,7 +1016,7 @@ struct FullDescriptionView: View {
                     .padding(.vertical, 48)
             }
         }
-        .onExitCommand { dismiss() }
+        .tvExitCommand { dismiss() }
     }
 }
 
@@ -1085,6 +1085,6 @@ struct FullDetailsView: View {
                 .padding(.vertical, 48)
             }
         }
-        .onExitCommand { dismiss() }
+        .tvExitCommand { dismiss() }
     }
 }

@@ -170,7 +170,7 @@ struct StreamView: View {
             persistSessionStart(startedAt)
         }
         // During streaming, VideoSurfaceView is first responder and intercepts Menu via UIKit,
-        // signaling us through menuPressCount. .onExitCommand fires when the focus engine is
+        // signaling us through menuPressCount. .tvExitCommand fires when the focus engine is
         // active: non-streaming states (loading, error) and while the pause menu holds focus —
         // there, B/Menu closes the menu just like Resume.
         .onChange(of: streamController.menuPressCount) { _, _ in
@@ -179,7 +179,7 @@ struct StreamView: View {
         .onChange(of: streamController.textEntryRequestCount) { _, _ in
             presentControllerTextEntry()
         }
-        .onExitCommand {
+        .tvExitCommand {
             if overlayState == .textEntry {
                 cancelControllerTextEntry()
             } else if overlayState == .pauseMenu {
@@ -188,7 +188,7 @@ struct StreamView: View {
                 disconnect()
             }
         }
-        .onPlayPauseCommand {
+        .tvPlayPauseCommand {
             guard streamController.state == .streaming else { return }
             togglePauseMenu()
         }

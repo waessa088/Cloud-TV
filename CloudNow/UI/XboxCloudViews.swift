@@ -2311,7 +2311,7 @@ private struct XboxCatalogRail: View {
                             XboxCatalogCardLabel(selection: selection)
                         }
                         .frame(width: 200)
-                        .buttonStyle(.card)
+                        .tvCardButtonStyle()
                         .id(focus)
                         .focused(focusedCard, equals: focus)
                         .contextMenu {
@@ -2337,7 +2337,7 @@ private struct XboxCatalogRail: View {
                 .padding(.horizontal, 60)
                 .padding(.vertical, 20)
             }
-            .focusSection()
+            .tvFocusSection()
             .scrollClipDisabled()
         }
     }
@@ -2686,7 +2686,7 @@ private struct XboxCatalogFilterBar: View {
         }
         .padding(.horizontal, 60)
         .padding(.vertical, 22)
-        .focusSection()
+        .tvFocusSection()
         .fullScreenCover(isPresented: $isShowingFilters) {
             XboxCatalogFilterSheet(
                 scope: scope,
@@ -3019,7 +3019,7 @@ private struct XboxCatalogFilterSheet: View {
                 }
             }
         }
-        .onExitCommand(perform: onClose)
+        .tvExitCommand(perform: onClose)
         .blocksGlobalControllerNavigation()
         .accessibilityIdentifier("xbox-catalog-filter-sheet")
     }
@@ -3523,7 +3523,7 @@ private struct XboxCatalogCarouselCard: View {
                 )
             }
         }
-        .focusSection()
+        .tvFocusSection()
     }
 
     private var cardBody: some View {

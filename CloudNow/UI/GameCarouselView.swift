@@ -152,13 +152,20 @@ struct CloudGameCarouselView<Item: Identifiable, Card: View>: View {
         }
         .ignoresSafeArea()
         .defaultFocus($focusedID, startID)
-        .onMoveCommand(perform: handleMoveCommand)
+        #if os(tvOS)
+            .onMoveCommand(perform: handleMoveCommand)
+        #else
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 40)
+                    .onEnded(handleSwipe)
+            )
+        #endif
         .handlesCarouselControllerNavigation(
             isEnabled: expandedID == nil,
             onPrevious: { moveCurrentCard(by: -1) },
             onNext: { moveCurrentCard(by: 1) }
         )
-        .onExitCommand {
+        .tvExitCommand {
             if expandedID != nil {
                 collapseExpandedCard()
             } else {
@@ -206,20 +213,35 @@ struct CloudGameCarouselView<Item: Identifiable, Card: View>: View {
         focusedID = destinationID
     }
 
-    private func handleMoveCommand(_ direction: MoveCommandDirection) {
-        guard expandedID == nil else { return }
+    #if os(tvOS)
+        private func handleMoveCommand(_ direction: MoveCommandDirection) {
+            guard expandedID == nil else { return }
 
-        switch direction {
-        case .left:
-            moveCurrentCard(by: -1)
-        case .right:
-            moveCurrentCard(by: 1)
-        case .down:
-            expandedID = items.first(where: { $0.id == currentID })?.id
-        default:
-            break
+            switch direction {
+            case .left:
+                moveCurrentCard(by: -1)
+            case .right:
+                moveCurrentCard(by: 1)
+            case .down:
+                expandedID = items.first(where: { $0.id == currentID })?.id
+            default:
+                break
+            }
         }
-    }
+    #else
+        /// iPadOS: horizontal swipe moves between cards, swipe up expands the current one.
+        private func handleSwipe(_ value: DragGesture.Value) {
+            guard expandedID == nil else { return }
+
+            let horizontal = value.translation.width
+            let vertical = value.translation.height
+            if abs(horizontal) > abs(vertical) {
+                moveCurrentCard(by: horizontal < 0 ? 1 : -1)
+            } else if vertical < 0 {
+                expandedID = items.first(where: { $0.id == currentID })?.id
+            }
+        }
+    #endif
 
     private static func imageAlignment(for distance: Int) -> HorizontalAlignment {
         if distance < 0 {
@@ -285,7 +307,7 @@ private struct CarouselCard: View {
                 .accessibilityAddTraits(isCurrent ? .isSelected : [])
             }
         }
-        .focusSection()
+        .tvFocusSection()
         .task(id: isCurrent) {
             showContent = false
             guard isCurrent else { return }

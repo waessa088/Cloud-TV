@@ -67,11 +67,11 @@ struct XboxLibraryRefreshProgressView: View {
                     .padding(.horizontal, 70)
                     .padding(.vertical, 24)
                 }
-                .focusSection()
+                .tvFocusSection()
                 .accessibilityIdentifier("xboxLibraryRefreshProgress")
             }
         }
-        .onExitCommand(perform: dismissFromHeader)
+        .tvExitCommand(perform: dismissFromHeader)
         .defaultFocus($focusedHeaderControl, defaultHeaderControl)
         .onChange(of: showsRetry) { _, retryAvailable in
             if !retryAvailable, focusedHeaderControl == .retry {

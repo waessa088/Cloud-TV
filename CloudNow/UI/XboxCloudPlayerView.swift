@@ -128,14 +128,14 @@ struct XboxCloudPlayerView: View {
                 endSession()
             }
         }
-        .onExitCommand {
+        .tvExitCommand {
             if controller.state == .streaming {
                 toggleOverlay()
             } else {
                 endSession()
             }
         }
-        .onPlayPauseCommand {
+        .tvPlayPauseCommand {
             guard controller.state == .streaming else { return }
             toggleOverlay()
         }

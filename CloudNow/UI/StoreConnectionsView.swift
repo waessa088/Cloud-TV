@@ -90,7 +90,7 @@ struct StoreConnectionsView: View {
         } message: { store in
             Text(L10n.format("disconnect_store_message", store.displayName))
         }
-        .onExitCommand {
+        .tvExitCommand {
             viewModel.cancelStoreConnection()
             dismiss()
         }
@@ -207,7 +207,7 @@ struct StoreConnectionsView: View {
                     onCancel: viewModel.cancelStoreConnection
                 )
             }
-            .onExitCommand {
+            .tvExitCommand {
                 viewModel.cancelStoreConnection()
             }
             .blocksGlobalControllerNavigation()

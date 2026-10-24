@@ -97,7 +97,7 @@ struct InstallToPlaySettingsView: View {
             onDismiss: { refreshRevision += 1 },
             content: { InstallToPlayAccountView() }
         )
-        .onExitCommand {
+        .tvExitCommand {
             dismiss()
         }
         .blocksGlobalControllerNavigation()
@@ -174,7 +174,7 @@ struct InstallToPlayAccountView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.background)
         .accessibilityIdentifier("install-to-play.account")
-        .onExitCommand {
+        .tvExitCommand {
             dismiss()
         }
         .blocksGlobalControllerNavigation()

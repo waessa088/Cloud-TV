@@ -1,0 +1,63 @@
+name: Build iPadOS
+
+on:
+  pull_request:
+    branches: ["**"]
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Print Xcode version
+        run: xcodebuild -version
+
+      - name: Resolve SPM dependencies
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project CloudNow.xcodeproj \
+            -scheme CloudNow \
+            -clonedSourcePackagesDirPath .spm-packages
+
+      - name: Archive for iPadOS
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project CloudNow.xcodeproj \
+            -scheme CloudNow \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/CloudTV-iPad.xcarchive" \
+            -clonedSourcePackagesDirPath .spm-packages \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee "$RUNNER_TEMP/build.log" | grep -E "error:|warning: .*(unavailable|deprecated)|\*\* ARCHIVE" || true
+          test -d "$RUNNER_TEMP/CloudTV-iPad.xcarchive/Products/Applications/CloudNow.app"
+
+      - name: Show compiler errors
+        if: failure()
+        run: grep -E "error:" "$RUNNER_TEMP/build.log" | sort -u | head -200
+
+      - name: Package IPA
+        run: |
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -r "$RUNNER_TEMP/CloudTV-iPad.xcarchive/Products/Applications/CloudNow.app" "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP"
+          zip -qr CloudTV-iPad.ipa Payload/
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudTV-iPad
+          path: ${{ runner.temp }}/CloudTV-iPad.ipa
+          retention-days: 30

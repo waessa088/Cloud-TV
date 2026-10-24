@@ -176,7 +176,7 @@ struct CloudResumableSessionBanner: View {
             }
             .padding(60)
         }
-        .focusSection()
+        .tvFocusSection()
         .accessibilityIdentifier("continue-playing")
     }
 }
@@ -258,7 +258,7 @@ struct CloudCatalogGrid<
                                 cardLabel(item)
                             }
                             .aspectRatio(2 / 3, contentMode: .fit)
-                            .buttonStyle(.card)
+                            .tvCardButtonStyle()
                             .focused(focusedId, equals: item.id)
                             .accessibilityIdentifier(
                                 accessibilityIdentifier(item)
@@ -273,7 +273,7 @@ struct CloudCatalogGrid<
                         }
                     }
                     .padding(60)
-                    .focusSection()
+                    .tvFocusSection()
                 }
             }
         }
@@ -405,7 +405,7 @@ struct CloudCatalogHeroBanner: View {
         .frame(height: 420)
         .clipShape(RoundedRectangle(cornerRadius: 20))
         .padding(.horizontal, 60)
-        .focusSection()
+        .tvFocusSection()
     }
 
     private var actionButton: some View {

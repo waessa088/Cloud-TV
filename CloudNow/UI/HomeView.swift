@@ -206,7 +206,7 @@ struct HomeView: View {
                 .padding(.horizontal, 60)
                 .padding(.vertical, 20)
             }
-            .focusSection()
+            .tvFocusSection()
             .scrollClipDisabled()
         }
     }
