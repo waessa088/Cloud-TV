@@ -29,4 +29,10 @@ enum HandoffText {
     static func receiving(_ title: String) -> String {
         isFrench ? "Reprise de \(title)…" : "Picking up \(title)…"
     }
+
+    static var notFound: String {
+        isFrench
+            ? "Session introuvable. Les deux appareils doivent être connectés au même compte GeForce NOW."
+            : "Session not found. Both devices must be signed in to the same GeForce NOW account."
+    }
 }

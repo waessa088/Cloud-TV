@@ -26,27 +26,29 @@ nonisolated struct HandoffPeer: Identifiable, Hashable, Sendable {
     let endpoint: NWEndpoint
 }
 
-/// Everything the receiving device needs to resume a GeForce NOW session that
-/// the sending device has just left. The server session itself never moves: it
-/// keeps running at NVIDIA, and the receiver claims it like any session started
-/// on another device.
+/// Identifies a GeForce NOW session that the sending device has just left.
+/// The server session itself never moves: it keeps running at NVIDIA and the
+/// receiver claims it like any session started on another device.
+///
+/// Security: the message carries no server address. A peer on the local
+/// network is untrusted, and the resume request carries the NVIDIA token, so the
+/// receiver only ever claims a session it finds in NVIDIA's own active-session
+/// list, using the server address that list returns.
 nonisolated struct HandoffMessage: Codable {
     static let currentVersion = 1
+    static let maxEncodedBytes = 256 * 1024
+    static let maxSessionIdLength = 256
 
     let version: Int
     let senderKind: HandoffDeviceKind
     let game: GameInfo
     let sessionId: String
     let appId: String?
-    let serverIp: String
-    let signalingUrl: String?
 
     init(
         game: GameInfo,
         sessionId: String,
         appId: String?,
-        serverIp: String,
-        signalingUrl: String?,
         senderKind: HandoffDeviceKind = .current
     ) {
         version = Self.currentVersion
@@ -54,23 +56,7 @@ nonisolated struct HandoffMessage: Codable {
         self.game = game
         self.sessionId = sessionId
         self.appId = appId
-        self.serverIp = serverIp
-        self.signalingUrl = signalingUrl
     }
-
-    /// The server-list shape StreamView already knows how to resume.
-    var activeSessionInfo: ActiveSessionInfo {
-        ActiveSessionInfo(
-            sessionId: sessionId,
-            status: 2,
-            appId: appId,
-            serverIp: serverIp,
-            signalingUrl: signalingUrl,
-            controlServerIp: nil
-        )
-    }
-
-    static let maxEncodedBytes = 256 * 1024
 
     func encoded() throws -> Data {
         try JSONEncoder().encode(self)
@@ -81,11 +67,17 @@ nonisolated struct HandoffMessage: Codable {
               let message = try? JSONDecoder().decode(HandoffMessage.self, from: data),
               message.version == currentVersion,
               !message.sessionId.isEmpty,
-              !message.serverIp.isEmpty
+              message.sessionId.count <= maxSessionIdLength
         else {
             return nil
         }
         return message
+    }
+
+    /// The session NVIDIA lists under this message's identifier, if any. Only
+    /// a listed session with a server address can be resumed.
+    func matchingSession(in sessions: [ActiveSessionInfo]) -> ActiveSessionInfo? {
+        sessions.first { $0.sessionId == sessionId && $0.serverIp?.isEmpty == false }
     }
 }
 

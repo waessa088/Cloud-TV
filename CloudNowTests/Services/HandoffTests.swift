@@ -6,16 +6,24 @@ import Testing
 struct HandoffTests {
     private func makeMessage(
         sessionId: String = "session-123",
-        serverIp: String = "10.0.0.8",
         title: String = "Café Éclair 🎮"
     ) -> HandoffMessage {
         HandoffMessage(
             game: TestGameFactory.make(id: "game-1", title: title),
             sessionId: sessionId,
             appId: "app-42",
-            serverIp: serverIp,
-            signalingUrl: "wss://example.invalid/sig",
             senderKind: .iPad
+        )
+    }
+
+    private func listed(_ sessionId: String, serverIp: String?) -> ActiveSessionInfo {
+        ActiveSessionInfo(
+            sessionId: sessionId,
+            status: 2,
+            appId: "app-42",
+            serverIp: serverIp,
+            signalingUrl: nil,
+            controlServerIp: nil
         )
     }
 
@@ -30,19 +38,38 @@ struct HandoffTests {
         #expect(decoded.game.title == "Café Éclair 🎮")
         #expect(decoded.sessionId == "session-123")
         #expect(decoded.appId == "app-42")
-        #expect(decoded.serverIp == "10.0.0.8")
-        #expect(decoded.signalingUrl == "wss://example.invalid/sig")
     }
 
-    @Test("F01-H2 The receiver resumes through the existing active-session path")
-    func activeSessionMapping() {
-        let info = makeMessage().activeSessionInfo
+    @Test("F01-H2 The receiver resumes only the session NVIDIA lists, with NVIDIA's address")
+    func resolvesAgainstServerList() throws {
+        let message = makeMessage()
+        let sessions = [
+            listed("other-session", serverIp: "203.0.113.9"),
+            listed("session-123", serverIp: "198.51.100.4"),
+        ]
 
-        #expect(info.sessionId == "session-123")
-        #expect(info.appId == "app-42")
-        #expect(info.serverIp == "10.0.0.8")
-        #expect(info.signalingUrl == "wss://example.invalid/sig")
-        #expect(info.controlServerIp == nil)
+        let match = try #require(message.matchingSession(in: sessions))
+        #expect(match.sessionId == "session-123")
+        #expect(match.serverIp == "198.51.100.4")
+    }
+
+    @Test("F01-N4 An unlisted or address-less session is never resumed")
+    func refusesUnlistedSessions() {
+        let message = makeMessage()
+
+        #expect(message.matchingSession(in: []) == nil)
+        #expect(message.matchingSession(in: [listed("other-session", serverIp: "203.0.113.9")]) == nil)
+        #expect(message.matchingSession(in: [listed("session-123", serverIp: nil)]) == nil)
+        #expect(message.matchingSession(in: [listed("session-123", serverIp: "")]) == nil)
+    }
+
+    @Test("F01-N5 The wire format carries no server address")
+    func noServerAddressOnTheWire() throws {
+        let json = try #require(
+            JSONSerialization.jsonObject(with: makeMessage().encoded()) as? [String: Any]
+        )
+        #expect(json["serverIp"] == nil)
+        #expect(json["signalingUrl"] == nil)
     }
 
     @Test("F01-N1 Garbage, empty and truncated payloads are rejected")
@@ -54,10 +81,11 @@ struct HandoffTests {
         #expect(HandoffMessage.decode(full.prefix(full.count / 2)) == nil)
     }
 
-    @Test("F01-N2 A message without a session or server is rejected")
-    func rejectsMissingIdentity() throws {
+    @Test("F01-N2 A message with an empty or absurd session identifier is rejected")
+    func rejectsBadSessionIdentifiers() throws {
         #expect(try HandoffMessage.decode(makeMessage(sessionId: "").encoded()) == nil)
-        #expect(try HandoffMessage.decode(makeMessage(serverIp: "").encoded()) == nil)
+        let long = String(repeating: "a", count: HandoffMessage.maxSessionIdLength + 1)
+        #expect(try HandoffMessage.decode(makeMessage(sessionId: long).encoded()) == nil)
     }
 
     @Test("F01-N3 A message from a different protocol version is rejected")
@@ -115,5 +143,6 @@ struct HandoffTests {
         #expect(!HandoffText.sendTo(.iPad).isEmpty)
         #expect(HandoffText.sendTo(.appleTV) != HandoffText.sendTo(.iPad))
         #expect(HandoffText.receiving("Halo").contains("Halo"))
+        #expect(!HandoffText.notFound.isEmpty)
     }
 }

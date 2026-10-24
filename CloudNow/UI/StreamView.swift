@@ -600,9 +600,7 @@ struct StreamView: View {
         let message = HandoffMessage(
             game: game,
             sessionId: session.sessionId,
-            appId: existingSession?.appId ?? game.variants.first?.appId ?? game.variants.first?.id,
-            serverIp: session.serverIp,
-            signalingUrl: session.signalingUrl
+            appId: existingSession?.appId ?? game.variants.first?.appId ?? game.variants.first?.id
         )
         Task {
             let delivered = await HandoffService.shared.send(message, to: peer)

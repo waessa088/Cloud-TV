@@ -144,23 +144,29 @@ extension MainTabView {
         handoffStatus = HandoffText.receiving(message.game.title)
         defer { handoffStatus = nil }
 
-        // Give the sender a moment to drop its connection, then prefer the
-        // server's own view of the session (fresh server address) when listed.
-        var session = message.activeSessionInfo
-        for _ in 0 ..< 4 {
+        // Give the sender a moment to drop its connection, then look the
+        // session up in NVIDIA's own list. Never use an address from the peer.
+        var listed: ActiveSessionInfo?
+        for _ in 0 ..< 8 {
             try? await Task.sleep(for: .seconds(1.5))
             await viewModel.refreshActiveSessions(authManager: authManager)
-            if let listed = viewModel.activeSessions.first(where: { $0.sessionId == message.sessionId }),
-               listed.serverIp != nil
-            {
-                session = listed
+            listed = message.matchingSession(in: viewModel.activeSessions)
+            if listed != nil {
                 break
             }
         }
+        guard let session = listed else {
+            handoffStatus = HandoffText.notFound
+            try? await Task.sleep(for: .seconds(5))
+            return
+        }
         guard gameToPlay == nil else { return }
+        // Prefer this device's own catalog entry over the peer's copy.
+        let localGame = (viewModel.libraryGames + viewModel.mainGames)
+            .first { $0.id == message.game.id }
         directSessionToResume = nil
         sessionToResume = session
-        gameToPlay = message.game
+        gameToPlay = localGame ?? message.game
     }
 }
 

@@ -1,0 +1,36 @@
+feature,area,priority,original,clone,notes
+Navigateur WebView plein écran sans barre Safari,cœur,must,yes,no,WKWebView ; masquage barre d'état et indicateur d'accueil
+Accueil avec tuiles des services pris en charge,cœur,must,yes,no,GeForce NOW / Xbox Cloud / Luna / Boosteroid / OnePlay ; tuiles texte sans logos
+Ouvrir une URL libre (jeux HTML5),cœur,must,yes,no,
+Manettes Bluetooth et USB-C (PlayStation Xbox MFi) via Gamepad API,entrées,must,yes,no,
+Clavier et souris externes avec pointer lock,entrées,must,yes,no,mode bureau auto quand une souris est branchée
+Session persistante (cookies) pour rester connecté aux services,cœur,must,yes,no,
+Abonnement mensuel annuel et achat à vie avec essai 7 jours,monétisation,must,yes,no,StoreKit 2 ; restaurer les achats ; synchro entre appareils via Apple ID
+Paywall,monétisation,must,yes,no,
+Réglages vidéo de base (résolution fps codec HDR),vidéo,must,yes,no,selon ce que chaque service et WKWebView exposent
+App Mac native (fenêtre plein écran menus raccourcis),mac,must,partial,no,l'original ne tourne sur Mac que comme app iPad ; angle de différenciation
+Mention de non-affiliation aux services,légal,must,yes,no,
+Favoris Quick Launch (lancer un jeu en un tap),favoris,should,yes,no,
+Personnalisation des favoris (nom image ordre),favoris,should,yes,no,
+Synchro iCloud des favoris,favoris,should,yes,no,
+Widgets écran d'accueil (1 jeu et grille de 4),favoris,should,yes,no,WidgetKit + deep link
+Recherche Spotlight des favoris,favoris,should,yes,no,
+Vibrations manette avec retour haptique du téléphone en secours,entrées,should,yes,no,
+Overlay performances (fps débit latence pertes de paquets),vidéo,should,yes,no,
+Sortie écran externe en résolution native avec écran noir sur l'iPhone,affichage,should,yes,no,
+Taille et position de l'image réglables,vidéo,should,yes,no,
+Volume global et audio 5.1/7.1,audio,should,yes,no,
+Vider cookies et cache,confidentialité,should,yes,no,
+Audio en arrière-plan compatible Discord,audio,should,yes,no,
+Souris virtuelle par gestes tactiles (iOS),entrées,could,yes,no,
+Réglage anti-deadzone,entrées,could,yes,no,
+Raccourci bouton Xbox / menu en jeu,entrées,could,yes,no,
+Curseurs de souris personnalisés,entrées,could,yes,no,
+Contrôles tactiles personnalisables avec mode trackpad pour FPS,entrées,could,no,no,demandé dans un avis App Store ; absent de l'original
+VoiceOver,accessibilité,could,yes,no,
+Steam Controller avec mapping clavier-souris complet,entrées,could,yes,skip,v2 ; gros chantier de mapping
+App compagnon Apple TV avec transfert depuis l'iPhone,apple tv,could,yes,skip,tvOS n'a pas de WebKit public ; mécanisme de l'original inconnu ; à rechercher à part
+Lunettes AR (XREAL Rokid VITURE RayNeo),affichage,could,yes,skip,couvert en grande partie par la sortie écran externe ; tests matériels
+App visionOS,plateformes,could,yes,skip,hors v1
+Gestionnaire de scripts Better xCloud intégré,services,could,yes,skip,script tiers ; vérifier sa licence avant toute intégration
+Catalogue de jeux et comptes des services,services,could,yes,skip,appartiennent aux services ; le joueur utilise ses propres comptes
