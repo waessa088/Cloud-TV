@@ -53,6 +53,8 @@ nonisolated struct HandoffMessage: Codable {
     /// When true the sender takes the session back: the receiver should let go
     /// of it (without ending it) instead of resuming it.
     let release: Bool?
+    /// The sender's controller mode, so the receiver applies the same routing.
+    let controllerMode: String?
 
     init(
         game: GameInfo,
@@ -60,6 +62,7 @@ nonisolated struct HandoffMessage: Codable {
         appId: String?,
         relayToken: UInt64? = nil,
         release: Bool = false,
+        controllerMode: ControllerMode? = nil,
         senderKind: HandoffDeviceKind = .current
     ) {
         version = Self.currentVersion
@@ -69,6 +72,11 @@ nonisolated struct HandoffMessage: Codable {
         self.appId = appId
         self.relayToken = relayToken.map { String($0, radix: 16) }
         self.release = release ? true : nil
+        self.controllerMode = controllerMode?.rawValue
+    }
+
+    var controllerModeValue: ControllerMode {
+        controllerMode.flatMap(ControllerMode.init(rawValue:)) ?? .automatic
     }
 
     var isRelease: Bool {
@@ -120,6 +128,9 @@ final class HandoffService {
     private(set) var relay: RelayState?
     /// A session another device is taking back; the player streaming it lets go.
     var releaseRequestedSessionId: String?
+    /// Set after a handoff in direct-Bluetooth mode: the player has to move the
+    /// controller pairing by hand, so the home screen explains how.
+    var showsPairingHint = false
 
     struct RelayState {
         let peer: HandoffPeer
@@ -127,7 +138,11 @@ final class HandoffService {
         let sessionId: String
         let appId: String?
         let controllerName: String
+        let mode: ControllerMode
     }
+
+    /// Live state of the relay link, refreshed a few times per second.
+    private(set) var relayStatus = RelayLinkStatus()
 
     @ObservationIgnored private var relaySender: RemoteGamepadSender?
     @ObservationIgnored private var relayReceiver: RemoteGamepadReceiver?
@@ -166,17 +181,25 @@ final class HandoffService {
 
     /// The controller to relay, when one is connected to this device.
     var relayableController: GCController? {
-        GCController.current?.extendedGamepad != nil
-            ? GCController.current
-            : GCController.controllers().first { $0.extendedGamepad != nil }
+        LocalGamepadSampler.preferredController()
     }
 
     /// iPad: keeps the local controller and streams it to `peer` after a handoff.
-    func startRelay(token: UInt64, to peer: HandoffPeer, game: GameInfo, sessionId: String, appId: String?) {
+    func startRelay(
+        token: UInt64,
+        to peer: HandoffPeer,
+        game: GameInfo,
+        sessionId: String,
+        appId: String?,
+        mode: ControllerMode,
+        deadzone: Float
+    ) {
         stopRelay()
-        let sampler = LocalGamepadSampler()
-        let sender = RemoteGamepadSender(toServiceNamed: peer.id, token: token) {
-            sampler.sample()
+        relayStatus = RelayLinkStatus()
+        let sender = RemoteGamepadSender(toServiceNamed: peer.id, token: token, deadzone: deadzone) { status in
+            Task { @MainActor in
+                HandoffService.shared.relayStatus = status
+            }
         }
         sender.start()
         relaySender = sender
@@ -185,7 +208,8 @@ final class HandoffService {
             game: game,
             sessionId: sessionId,
             appId: appId,
-            controllerName: relayableController?.vendorName ?? "Manette"
+            controllerName: relayableController?.vendorName ?? "Manette",
+            mode: mode
         )
         setIdleTimerDisabled(true)
         handoffLog.info("Relaying the controller to \(peer.kind.rawValue, privacy: .public)")
@@ -289,7 +313,11 @@ final class HandoffService {
             return
         }
         if let token = message.relayTokenValue {
-            RemoteGamepadInbox.shared.beginSession(token: token)
+            RemoteGamepadInbox.shared.beginSession(
+                token: token,
+                mode: message.controllerModeValue,
+                directControllerActive: LocalGamepadSampler.preferredController() != nil
+            )
         } else {
             RemoteGamepadInbox.shared.endSession()
         }
@@ -464,45 +492,5 @@ private final nonisolated class ResumeOnce: @unchecked Sendable {
         guard let pending else { return false }
         pending.resume(returning: value)
         return true
-    }
-}
-
-/// Reads the locally paired controller for the relay. Only touched from the
-/// relay sender's queue. The controller's Home button opens the pause menu on
-/// the receiving device instead of reaching the game.
-final nonisolated class LocalGamepadSampler: @unchecked Sendable {
-    /// XInput Guide bit (GFNInput.guide); Home is used for the pause menu instead.
-    private static let guideButtonMask: UInt16 = 0x0400
-    private var homeWasPressed = false
-    private var menuPresses: UInt8 = 0
-    private var configuredController: ObjectIdentifier?
-
-    func sample() -> RelayedGamepadState? {
-        let controller = GCController.current?.extendedGamepad != nil
-            ? GCController.current
-            : GCController.controllers().first { $0.extendedGamepad != nil }
-        guard let controller, let pad = controller.extendedGamepad else { return nil }
-
-        if configuredController != ObjectIdentifier(controller) {
-            configuredController = ObjectIdentifier(controller)
-            pad.buttonHome?.preferredSystemGestureState = .disabled
-        }
-        let homePressed = pad.buttonHome?.isPressed ?? false
-        if homePressed, !homeWasPressed {
-            menuPresses &+= 1
-        }
-        homeWasPressed = homePressed
-
-        let mapped = mapGCControllerToXInput(controller)
-        return RelayedGamepadState(
-            buttons: mapped.buttons & ~Self.guideButtonMask,
-            leftTrigger: mapped.leftTrigger,
-            rightTrigger: mapped.rightTrigger,
-            leftStickX: mapped.lx,
-            leftStickY: mapped.ly,
-            rightStickX: mapped.rx,
-            rightStickY: mapped.ry,
-            menuPresses: menuPresses
-        )
     }
 }

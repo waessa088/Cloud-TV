@@ -26,6 +26,11 @@ struct GlassPauseMenu: View {
     let onToggleRemoteMode: () -> Void
     let onLeave: () -> Void
     let onEndRequest: () -> Void
+    var onController: () -> Void = {}
+    /// Pause-menu commands from a relayed controller (tvOS focus does not
+    /// follow it); the counter changes on every press.
+    var relayCommandCount = 0
+    var relayCommand: RelayMenuCommand?
 
     @FocusState private var focusedCard: Card?
 
@@ -33,7 +38,45 @@ struct GlassPauseMenu: View {
         case resume
         case handoff(String)
         case statistics
+        case controller
         case home
+    }
+
+    private var orderedCards: [Card] {
+        [.resume] + handoffTargets.map { .handoff($0.id) } + [.statistics, .controller, .home]
+    }
+
+    private func perform(_ card: Card) {
+        switch card {
+        case .resume:
+            onResume()
+        case let .handoff(id):
+            if let target = handoffTargets.first(where: { $0.id == id }), !target.isBusy {
+                target.action()
+            }
+        case .statistics:
+            onCycleStatistics()
+        case .controller:
+            onController()
+        case .home:
+            onLeave()
+        }
+    }
+
+    private func apply(_ command: RelayMenuCommand?) {
+        guard let command else { return }
+        let cards = orderedCards
+        let index = focusedCard.flatMap { cards.firstIndex(of: $0) } ?? 0
+        switch command {
+        case .previous:
+            focusedCard = cards[max(index - 1, 0)]
+        case .next:
+            focusedCard = cards[min(index + 1, cards.count - 1)]
+        case .select:
+            perform(cards[index])
+        case .close:
+            onResume()
+        }
     }
 
     var body: some View {
@@ -54,6 +97,7 @@ struct GlassPauseMenu: View {
         .foregroundStyle(.white)
         .defaultFocus($focusedCard, .resume)
         .onAppear { focusedCard = .resume }
+        .onChange(of: relayCommandCount) { _, _ in apply(relayCommand) }
     }
 
     // MARK: Header
@@ -160,6 +204,15 @@ struct GlassPauseMenu: View {
                 )
                 .focused($focusedCard, equals: .statistics)
                 .accessibilityIdentifier("stream.pause.statistics")
+
+                GlassMenuCard(
+                    title: PauseMenuText.controller,
+                    subtitle: PauseMenuText.controllerSubtitle,
+                    systemImage: "gamecontroller",
+                    action: onController
+                )
+                .focused($focusedCard, equals: .controller)
+                .accessibilityIdentifier("stream.pause.controller")
 
                 GlassMenuCard(
                     title: PauseMenuText.home,
@@ -346,6 +399,14 @@ enum PauseMenuText {
         isFrench ? "Accueil" : "Home"
     }
 
+    static var controller: String {
+        isFrench ? "Manette" : "Controller"
+    }
+
+    static var controllerSubtitle: String {
+        isFrench ? "Connexion et test" : "Connection and test"
+    }
+
     static var gameStaysOpen: String {
         isFrench ? "La partie reste ouverte" : "The game stays open"
     }
@@ -362,8 +423,9 @@ enum PauseMenuText {
     static var hints: [Hint] {
         #if os(tvOS)
             [
-                Hint(key: "Menu", label: isFrench ? "Fermer" : "Close"),
-                Hint(key: "A", label: isFrench ? "Valider" : "Select"),
+                Hint(key: "PS", label: isFrench ? "Fermer" : "Close"),
+                Hint(key: "✕", label: isFrench ? "Valider" : "Select"),
+                Hint(key: "○", label: isFrench ? "Retour au jeu" : "Back to game"),
             ]
         #else
             [

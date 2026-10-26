@@ -695,6 +695,10 @@ final nonisolated class InputSender: @unchecked Sendable {
 
     /// Called when the user long-presses the overlay trigger button to toggle the GFN overlay.
     var menuToggleHandler: (@MainActor @Sendable () -> Void)?
+    /// Pause-menu navigation from a relayed controller. tvOS focus only follows
+    /// controllers connected to the TV itself, so relayed D-pad, Cross and
+    /// Circle presses are turned into menu commands while the menu is open.
+    var relayMenuCommandHandler: (@MainActor @Sendable (RelayMenuCommand) -> Void)?
 
     /// Called when remoteMode changes due to controller connect/disconnect auto-switching.
     var onRemoteModeChanged: (@MainActor @Sendable (RemoteInputMode) -> Void)?
@@ -720,6 +724,7 @@ final nonisolated class InputSender: @unchecked Sendable {
     /// Slot used by a controller relayed from another Cloud TV device.
     private var relayedSlot: Int?
     private var lastRelayedMenuPresses: UInt8?
+    private var lastRelayedMenuButtons: UInt16 = 0
     private var sonyGamepadEnabled = false
     private var sonySlots = Set<Int>()
     private var sonyAttachTokens: [Int: UUID] = [:]
@@ -790,11 +795,21 @@ final nonisolated class InputSender: @unchecked Sendable {
             timer.setEventHandler { [weak self] in self?.tick() }
             sampler = timer
             timer.resume()
+            // Relayed controller states are forwarded the moment they arrive
+            // rather than at the next 120 Hz tick.
+            RemoteGamepadInbox.shared.setUpdateHandler { [weak self] in
+                guard let self else { return }
+                inputQueue.async { [weak self] in
+                    guard let self, isRunning else { return }
+                    pollRelayedGamepad(now: DispatchTime.now().uptimeNanoseconds)
+                }
+            }
         }
         GCController.startWirelessControllerDiscovery()
     }
 
     func stop() {
+        RemoteGamepadInbox.shared.setUpdateHandler(nil)
         inputQueue.sync {
             isRunning = false
             cancelKeyboardReplay()
@@ -835,6 +850,9 @@ final nonisolated class InputSender: @unchecked Sendable {
     /// TV handoff). It takes a free slot while fresh state arrives and gives it
     /// back, after a neutral report, as soon as the relay goes quiet.
     private func pollRelayedGamepad(now: UInt64) {
+        // A controller connected to this device directly takes over from the
+        // relay in automatic mode, so one player is never driven twice.
+        RemoteGamepadInbox.shared.setDirectControllerActive(!extendedControllers.isEmpty)
         guard let relayed = RemoteGamepadInbox.shared.current() else {
             releaseRelayedSlot()
             return
@@ -854,7 +872,15 @@ final nonisolated class InputSender: @unchecked Sendable {
             notifyMenuToggle()
         }
         lastRelayedMenuPresses = relayed.menuPresses
-        guard !isPaused else { return }
+        let pressed = relayed.buttons & ~lastRelayedMenuButtons
+        lastRelayedMenuButtons = relayed.buttons
+        guard !isPaused else {
+            if let command = RelayMenuCommand(pressedButtons: pressed) {
+                let handler = relayMenuCommandHandler
+                DispatchQueue.main.async { handler?(command) }
+            }
+            return
+        }
         sendGamepadSnapshot(
             GamepadSnapshot(
                 buttons: relayed.buttons,
@@ -875,6 +901,7 @@ final nonisolated class InputSender: @unchecked Sendable {
         guard let slot = relayedSlot else { return }
         relayedSlot = nil
         lastRelayedMenuPresses = nil
+        lastRelayedMenuButtons = 0
         gamepadBitmap &= ~Self.extendedGamepadBitmapMask(for: slot)
         sendGamepadSnapshot(neutralSnapshot(bitmap: gamepadBitmap), slot: slot, force: true)
         lastSnapshots[slot] = nil
@@ -2254,5 +2281,29 @@ extension InputSender: InputEventHandler {
             mods |= 0x0008
         }
         return mods
+    }
+}
+
+/// A pause-menu action from a relayed controller (see relayMenuCommandHandler).
+nonisolated enum RelayMenuCommand: Equatable, Sendable {
+    case previous
+    case next
+    case select
+    case close
+
+    /// The first newly pressed menu button, if any. XInput layout: Cross = A,
+    /// Circle = B on a DualShock 4.
+    init?(pressedButtons: UInt16) {
+        if pressedButtons & GFNInput.dpadLeft != 0 || pressedButtons & GFNInput.dpadUp != 0 {
+            self = .previous
+        } else if pressedButtons & GFNInput.dpadRight != 0 || pressedButtons & GFNInput.dpadDown != 0 {
+            self = .next
+        } else if pressedButtons & GFNInput.buttonA != 0 {
+            self = .select
+        } else if pressedButtons & GFNInput.buttonB != 0 {
+            self = .close
+        } else {
+            return nil
+        }
     }
 }

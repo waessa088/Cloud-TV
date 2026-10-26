@@ -338,6 +338,10 @@ final class GFNStreamController: NSObject {
     /// Incremented each time the user presses Menu while VideoSurfaceView is first responder.
     /// SwiftUI observes this via .onChange to toggle the HUD overlay.
     private(set) var menuPressCount: Int = 0
+    /// Latest pause-menu command from a relayed controller, with a counter so
+    /// repeated presses of the same button are each observed.
+    private(set) var relayMenuCommandCount = 0
+    private(set) var lastRelayMenuCommand: RelayMenuCommand?
     /// Incremented when the controller keyboard shortcut requests local text entry.
     private(set) var textEntryRequestCount: Int = 0
 
@@ -2412,6 +2416,11 @@ extension GFNStreamController: LKRTCDataChannelDelegate {
             sender.menuToggleHandler = { [weak self, weak sender] in
                 guard let self, inputSender === sender else { return }
                 handleMenuPress()
+            }
+            sender.relayMenuCommandHandler = { [weak self, weak sender] command in
+                guard let self, inputSender === sender else { return }
+                lastRelayMenuCommand = command
+                relayMenuCommandCount += 1
             }
             sender.onRemoteModeChanged = { [weak self, weak sender] mode in
                 guard let self, inputSender === sender else { return }

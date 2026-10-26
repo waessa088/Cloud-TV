@@ -57,6 +57,9 @@ struct MainTabView: View {
                 StoreView(onPlay: { gameToPlay = $0 })
                     .accessibilityIdentifier("store-screen")
             }
+            Tab(ControllerText.title, systemImage: "gamecontroller.fill", value: AppTab.controller) {
+                ControllerPanelView()
+            }
             Tab(L10n.text("settings"), systemImage: "gearshape.fill", value: AppTab.settings) {
                 SettingsView()
                     .accessibilityIdentifier("settings-screen")
@@ -99,6 +102,19 @@ struct MainTabView: View {
             }
         }
         .animation(.easeInOut(duration: 0.25), value: handoffStatus)
+        .sheet(isPresented: Bindable(HandoffService.shared).showsPairingHint) {
+            VStack(alignment: .leading, spacing: 18) {
+                Text(ControllerText.pairingSection)
+                    .font(.title2.weight(.bold))
+                Text(ControllerText.pairingSteps)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button(ControllerText.done) { HandoffService.shared.showsPairingHint = false }
+                    .buttonStyle(.glassProminent)
+                    .accessibilityIdentifier("controller.pairing-hint.done")
+            }
+            .padding(32)
+            .accessibilityIdentifier("controller.pairing-hint")
+        }
         .overlay {
             if let relay = HandoffService.shared.relay {
                 HandoffRelayView(
@@ -204,6 +220,7 @@ private nonisolated enum AppTab: CloudNowTabSelection {
     case home
     case library
     case store
+    case controller
     case settings
 
     static let first = AppTab.home
@@ -216,6 +233,8 @@ private nonisolated enum AppTab: CloudNowTabSelection {
         case .library:
             .store
         case .store:
+            .controller
+        case .controller:
             .settings
         case .settings:
             .home
@@ -230,8 +249,10 @@ private nonisolated enum AppTab: CloudNowTabSelection {
             .home
         case .store:
             .library
-        case .settings:
+        case .controller:
             .store
+        case .settings:
+            .controller
         }
     }
 }

@@ -1,3 +1,4 @@
+import GameController
 import os.log
 import SwiftUI
 
@@ -69,6 +70,8 @@ struct StreamView: View {
     @State private var isEndingSession = false
     @State private var isHandingOff = false
     @State private var handoffError: String?
+    @State private var showControllerPanel = false
+    @State private var showMissingControllerHint = false
     /// Per-ad state tracking to avoid duplicate reports
     @State private var adReportedAction: [String: AdAction] = [:]
 
@@ -158,6 +161,11 @@ struct StreamView: View {
         .onChange(of: streamController.state) { oldState, state in
             if state == .streaming {
                 MemoryLifecycleCoordinator.shared.streamDidStart()
+                // Back on the iPad after playing on the TV, the controller may
+                // still be paired to the TV: say so instead of failing silently.
+                if HandoffDeviceKind.current == .iPad, LocalGamepadSampler.preferredController() == nil {
+                    showMissingControllerHint = true
+                }
             } else if oldState == .streaming {
                 MemoryLifecycleCoordinator.shared.streamDidLeavePlayback()
             }
@@ -200,6 +208,31 @@ struct StreamView: View {
             togglePauseMenu()
         }
         .immersiveOnIPad()
+        .sheet(isPresented: $showControllerPanel) {
+            ControllerPanelView(onClose: { showControllerPanel = false })
+        }
+        .overlay(alignment: .top) {
+            if showMissingControllerHint {
+                Text(ControllerText.missingOnIPad)
+                    .font(.callout.weight(.medium))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 12)
+                    .glassEffect(.regular, in: .capsule)
+                    .padding(.top, 24)
+                    .padding(.horizontal, 40)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .task {
+                        try? await Task.sleep(for: .seconds(10))
+                        showMissingControllerHint = false
+                    }
+                    .accessibilityIdentifier("stream.controller-missing")
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .GCControllerDidConnect)) { _ in
+            showMissingControllerHint = false
+        }
+        .animation(.easeInOut(duration: 0.25), value: showMissingControllerHint)
     }
 
     // MARK: Connecting
@@ -519,7 +552,10 @@ struct StreamView: View {
             },
             onToggleRemoteMode: { streamController.toggleRemoteMode() },
             onLeave: leave,
-            onEndRequest: { showExitConfirmation = true }
+            onEndRequest: { showExitConfirmation = true },
+            onController: { showControllerPanel = true },
+            relayCommandCount: streamController.relayMenuCommandCount,
+            relayCommand: streamController.lastRelayMenuCommand
         )
     }
 
@@ -574,11 +610,16 @@ struct StreamView: View {
         isHandingOff = true
         handoffError = nil
         let handoff = HandoffService.shared
-        // iPad → Apple TV: keep the controller here and relay it, so it never
-        // has to be re-paired. The TV's own controllers keep working too.
+        // iPad → Apple TV: per the controller mode, keep the controller here and
+        // relay it so it never has to be re-paired. The session handoff below is
+        // the same whether or not the controller is relayed.
+        let controllerMode = ControllerMode.load()
         let relayToken: UInt64? = HandoffDeviceKind.current == .iPad
             && peer.kind == .appleTV
-            && handoff.relayableController != nil
+            && ControllerRoutingPolicy.senderRelays(
+                mode: controllerMode,
+                hasLocalController: handoff.relayableController != nil
+            )
             ? UInt64.random(in: 1 ... UInt64.max)
             : nil
         let appId = existingSession?.appId ?? game.variants.first?.appId ?? game.variants.first?.id
@@ -586,7 +627,8 @@ struct StreamView: View {
             game: game,
             sessionId: session.sessionId,
             appId: appId,
-            relayToken: relayToken
+            relayToken: relayToken,
+            controllerMode: controllerMode
         )
         Task {
             let delivered = await handoff.send(message, to: peer)
@@ -596,13 +638,18 @@ struct StreamView: View {
                 return
             }
             releaseSessionForHandoff()
+            if HandoffDeviceKind.current == .iPad, controllerMode == .bluetoothDirect {
+                handoff.showsPairingHint = true
+            }
             if let relayToken {
                 handoff.startRelay(
                     token: relayToken,
                     to: peer,
                     game: game,
                     sessionId: session.sessionId,
-                    appId: appId
+                    appId: appId,
+                    mode: controllerMode,
+                    deadzone: Float(settings.controllerDeadzone)
                 )
             }
         }

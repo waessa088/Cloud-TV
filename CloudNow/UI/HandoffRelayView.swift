@@ -41,6 +41,8 @@ struct HandoffRelayView: View {
                     .font(.callout)
                     .foregroundStyle(.white.opacity(0.55))
 
+                relayLink
+
                 VStack(spacing: 12) {
                     Button(action: onResumeHere) {
                         Label(HandoffText.resumeHere, systemImage: "ipad.landscape")
@@ -62,5 +64,28 @@ struct HandoffRelayView: View {
         }
         .preferredColorScheme(.dark)
         .immersiveOnIPad()
+    }
+
+    /// Link state and measured relay latency, refreshed a few times a second.
+    private var relayLink: some View {
+        let status = HandoffService.shared.relayStatus
+        let text = !status.acknowledged
+            ? ControllerText.relayWaiting
+            : (status.relayInUse ? ControllerText.relayActive : ControllerText.relaySuspended)
+        return VStack(spacing: 8) {
+            Text(text)
+                .font(.callout.weight(.medium))
+                .multilineTextAlignment(.center)
+            if status.relayInUse, status.latency.count > 0 {
+                Text("\(ControllerText.median) \(LatencyStats.milliseconds(status.latency.median)) · P95 \(LatencyStats.milliseconds(status.latency.p95)) · P99 \(LatencyStats.milliseconds(status.latency.p99))")
+                    .font(.footnote.monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+        }
+        .padding(.horizontal, 22)
+        .padding(.vertical, 14)
+        .glassEffect(.regular, in: .rect(cornerRadius: 22))
+        .frame(maxWidth: 560)
+        .accessibilityIdentifier("handoff-relay.status")
     }
 }
