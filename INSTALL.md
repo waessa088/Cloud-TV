@@ -1,13 +1,14 @@
-# Installer Cloud TV avec Sideloadly
+# Installer Nimbus
 
-Il y a deux fichiers à installer, un par appareil :
-- `CloudTV-tvOS.ipa` → l'Apple TV (Apple TV 4K 2e génération ou plus récente, tvOS 26.2 ou plus) ;
-- `CloudTV-iPadOS.ipa` → l'iPad (iPadOS 26 ou plus).
+Trois fichiers, un par appareil :
+- `CloudTV-tvOS.ipa` → l'Apple TV (Apple TV 4K 2e génération ou plus récente, tvOS 26.2 ou plus), avec Sideloadly ;
+- `CloudTV-iPadOS.ipa` → l'iPad (iPadOS 26 ou plus), avec Sideloadly ;
+- `Nimbus-macOS.zip` → le Mac (macOS 26 ou plus), sans Sideloadly (voir « Installer sur le Mac »).
 
 ## 1. Télécharger les IPA
 
 1. Ouvre https://github.com/waessa088/Cloud-TV/releases
-2. Dans la version la plus récente (en haut), section « Assets », télécharge `CloudTV-tvOS.ipa` et `CloudTV-iPadOS.ipa`.
+2. Dans la version la plus récente (en haut), section « Assets », télécharge `CloudTV-tvOS.ipa`, `CloudTV-iPadOS.ipa` et `Nimbus-macOS.zip`.
 
 ## 2. Préparer Sideloadly sur le Mac
 
@@ -48,3 +49,24 @@ La manette Bluetooth ne suit pas toute seule : une manette PS5 ou Xbox n'est app
 
 - **Apple ID gratuit** : les apps expirent au bout de **7 jours**. Active l'**actualisation automatique** dans Sideloadly : il les re-signe tout seul tant que le Mac est allumé et sur le même réseau. Limite Apple : 3 apps installées de cette façon par appareil.
 - **Compte développeur payant (99 $/an)** : les apps restent valides **un an**, sans rien faire.
+
+## Installer sur le Mac
+
+1. Double-clique sur `Nimbus-macOS.zip` : il se décompresse en **Nimbus.app**. Glisse-la dans **Applications**.
+2. Au premier lancement, macOS refuse d'ouvrir une app qui ne vient pas de l'App Store. Va dans **Réglages Système › Confidentialité et sécurité**, descends jusqu'à « Nimbus a été bloquée » et clique sur **Ouvrir quand même**, puis confirme.
+3. Accepte l'accès au **réseau local** : c'est ce qui permet de voir l'iPad et l'Apple TV.
+
+Sur Mac, la souris ou le trackpad est capturé par le jeu pendant la partie. **⌘⇧M** (ou le bouton PS de la manette) ouvre le menu et libère la souris.
+
+L'app Mac n'expire pas : elle est signée localement (« ad hoc »), sans compte Apple.
+
+## Manette : modes et latence
+
+Onglet **Manette** (ou carte « Manette » du menu en jeu) :
+- **Automatique (recommandé)** : manette locale quand tu joues ici ; après un passage sur l'Apple TV, l'iPad ou le Mac relaie sa manette, sauf si une manette est connectée directement à la TV (elle est alors prioritaire, sans double commande).
+- **Bluetooth direct** : pas de relais. Il faut appairer la manette à l'appareil qui affiche le jeu (étapes affichées dans l'app). Aucune app ne peut déplacer un appairage Bluetooth automatiquement.
+- **Relais Wi-Fi** et **USB** : la manette reste sur l'iPad ou le Mac et ses commandes partent vers l'Apple TV. Le mode USB ne fonctionne que si iPadOS reconnaît la manette par câble.
+
+L'écran affiche la **latence ajoutée par le relais** (médiane, P95, P99), mesurée en continu. C'est une estimation (aller-retour ÷ 2) qui dépend du Wi-Fi, pas une garantie.
+
+Si la manette ne répond plus en revenant sur l'iPad, c'est qu'elle est restée appairée à l'Apple TV : remets-la en appairage (Share + PS pendant 3 secondes) et choisis-la dans Réglages › Bluetooth.
