@@ -12,17 +12,19 @@ struct RelayLatencyBenchmarkTests {
     @MainActor
     func loopbackLatency() async throws {
         let receiver = RemoteGamepadReceiver()
-        receiver.start(instanceName: "NimbusBench-\(UUID().uuidString.prefix(6))")
+        // No Bonjour advertising: CI machines may refuse mDNS registration.
+        receiver.start(instanceName: nil)
         defer { receiver.stop() }
 
         var port: UInt16?
-        for _ in 0 ..< 100 {
+        for _ in 0 ..< 250 {
             port = receiver.port
-            if port != nil {
+            if port != nil, receiver.isReady {
                 break
             }
             try await Task.sleep(for: .milliseconds(20))
         }
+        #expect(receiver.isReady)
         let listeningPort = try #require(port)
 
         RemoteGamepadInbox.shared.beginSession(token: 77, mode: .wifiRelay)

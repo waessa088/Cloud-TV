@@ -276,8 +276,11 @@ final class RemoteGamepadReceiver {
 
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "com.waessa.CloudTV.relay.receive", qos: .userInteractive)
+    private let readiness = RelayReadiness()
 
-    func start(instanceName: String) {
+    /// Starts listening. `instanceName` advertises the receiver over Bonjour;
+    /// nil listens without advertising (used by the loopback benchmark).
+    func start(instanceName: String?) {
         guard listener == nil else { return }
         let parameters = NWParameters.udp
         parameters.serviceClass = .interactiveVoice
@@ -285,10 +288,36 @@ final class RemoteGamepadReceiver {
             relayLog.error("Relay listener could not be created")
             return
         }
-        listener.service = NWListener.Service(name: instanceName, type: Self.serviceType)
+        if let instanceName {
+            listener.service = NWListener.Service(name: instanceName, type: Self.serviceType)
+        }
         listener.newConnectionHandler = Self.makeConnectionHandler(queue: queue)
+        listener.stateUpdateHandler = Self.makeStateHandler(readiness)
         listener.start(queue: queue)
         self.listener = listener
+    }
+
+    /// True once the listener accepts datagrams.
+    var isReady: Bool {
+        readiness.isReady
+    }
+
+    private nonisolated static func makeStateHandler(
+        _ readiness: RelayReadiness
+    ) -> @Sendable (NWListener.State) -> Void {
+        { state in
+            switch state {
+            case .ready:
+                readiness.set(true)
+            case let .failed(error):
+                readiness.set(false)
+                relayLog.error("Relay listener failed: \(error.localizedDescription, privacy: .public)")
+            case .cancelled:
+                readiness.set(false)
+            default:
+                break
+            }
+        }
     }
 
     func stop() {
@@ -333,6 +362,24 @@ final class RemoteGamepadReceiver {
                 connection.cancel()
             }
         }
+    }
+}
+
+/// Thread-safe ready flag for the relay listener.
+final nonisolated class RelayReadiness: @unchecked Sendable {
+    private let lock = NSLock()
+    private var ready = false
+
+    var isReady: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return ready
+    }
+
+    func set(_ value: Bool) {
+        lock.lock()
+        ready = value
+        lock.unlock()
     }
 }
 
