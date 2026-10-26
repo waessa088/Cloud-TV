@@ -65,6 +65,16 @@ Status: fixed — pointeur verrouillé et masqué pendant le jeu, rendu dans le 
 - Flow / case: F01 / F01-H5
 Status: fixed — la manette reste appairée à l'iPad et ses commandes sont relayées à l'Apple TV par le Wi-Fi local (tests `RemoteGamepadRelayTests`).
 
+### BUG-007: la manette ne se reconnecte plus en revenant sur l'iPad
+
+- Severity: S2
+- Flow / case: F05 / F05-4
+- Build: ba91a9f  Device: iPad Pro M4 + DualShock 4 + Apple TV (retour de Wail)
+
+Actual: après une partie sur l'Apple TV, la manette ne fonctionne plus sur l'iPad.
+Suspected cause: matérielle et système, pas l'app : si la DS4 a été appairée à l'Apple TV, elle se reconnecte au dernier appareil appairé ; aucune API Apple ne permet à une app de déplacer cet appairage.
+Status: mitigé — en mode Automatique, la manette reste sur l'iPad et passe par le relais (rien à réappairer) ; si une partie démarre sur l'iPad sans manette, Nimbus l'affiche avec la marche à suivre ; écran « Manette » avec les étapes d'appairage. À confirmer sur appareil.
+
 ## À vérifier (non reproduit)
 
 - Si Cloud TV est en mode Xbox sur la TV au moment de la bascule, la demande n'est traitée qu'au retour en mode GeForce NOW.

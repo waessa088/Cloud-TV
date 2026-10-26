@@ -63,3 +63,21 @@ Légende : ✅ automatisé (CI) · 🖐 à vérifier à la main sur tes appareil
 | F04-E1 | paquets en désordre ou dupliqués ignorés | ✅ `inboxDropsOldSequences` |
 | F04-E2 | relais coupé (iPad en veille) → manette neutre, aucun bouton bloqué | ✅ `inboxGoesStale` |
 | F04-E3 | fin de session → plus rien n'est accepté | ✅ `inboxEndSession` |
+
+## F05 — Smart Controller Handoff (à valider sur appareil, Warzone)
+
+Mesures à relever dans l'écran « Manette » de l'iPad (médiane / P95 / P99) pour chaque cas avec relais.
+
+| cas | description | comment |
+| --- | --- | --- |
+| F05-1 | DualShock 4 Bluetooth sur iPad, partie Warzone locale | 🖐 |
+| F05-2 | DualShock 4 Bluetooth sur Apple TV, partie Warzone locale | 🖐 |
+| F05-3 | Transfert iPad → Apple TV (mode Automatique) : la manette continue via le relais | 🖐 |
+| F05-4 | Transfert Apple TV → iPad : commandes locales restaurées, relais arrêté | 🖐 |
+| F05-5 | Relais depuis l'iPad, manette en Bluetooth : latence relevée | 🖐 |
+| F05-6 | Relais depuis l'iPad, manette en USB (si iPadOS la reconnaît) : latence relevée | 🖐 |
+| F05-7 | En Automatique, manette connectée directement à la TV : relais en veille, pas de double commande | ✅ `directControllerSuspendsRelay` + 🖐 |
+| F05-8 | Coupure Wi-Fi ou iPad verrouillé pendant le relais : aucun bouton bloqué sur la TV | ✅ `inboxGoesStale` + 🖐 |
+| F05-9 | Menu pause de la TV piloté par la manette relayée (croix, ✕, ○) | ✅ `menuCommands` + 🖐 |
+| F05-10 | Précision : sticks et gâchettes transmis sans perte ni lissage | ✅ `fullPrecision` |
+| F05-11 | Latence logicielle du relais en boucle locale (médiane / P95 / P99 dans le journal CI) | ✅ `loopbackLatency` |
