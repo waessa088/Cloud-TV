@@ -270,7 +270,7 @@ final nonisolated class RemoteGamepadInbox: @unchecked Sendable {
 /// acknowledges what it accepted.
 @MainActor
 final class RemoteGamepadReceiver {
-    static let serviceType = "_cloudtvpad._udp"
+    nonisolated static let serviceType = "_cloudtvpad._udp"
     /// Acknowledge one state in this many; flag changes are always acknowledged.
     nonisolated static let ackEvery: UInt32 = 4
 
@@ -388,13 +388,13 @@ final nonisolated class RemoteGamepadSender: @unchecked Sendable {
             receiveAcks()
             attachCurrentController()
             let center = NotificationCenter.default
+            let reattach: @Sendable (Notification) -> Void = { [weak self] _ in
+                guard let self else { return }
+                queue.async { self.attachCurrentController() }
+            }
             observers = [
-                center.addObserver(forName: .GCControllerDidBecomeCurrent, object: nil, queue: nil) { [weak self] _ in
-                    self?.queue.async { self?.attachCurrentController() }
-                },
-                center.addObserver(forName: .GCControllerDidDisconnect, object: nil, queue: nil) { [weak self] _ in
-                    self?.queue.async { self?.attachCurrentController() }
-                },
+                center.addObserver(forName: .GCControllerDidBecomeCurrent, object: nil, queue: nil, using: reattach),
+                center.addObserver(forName: .GCControllerDidDisconnect, object: nil, queue: nil, using: reattach),
             ]
             scheduleTimer()
         }
