@@ -34,11 +34,7 @@ jobs:
 
       - name: Print relay latency benchmark
         if: always()
-        run: |
-          r=$(ls -td TestArtifacts/**/*.xcresult TestArtifacts/*.xcresult 2>/dev/null | head -1)
-          if [ -n "$r" ]; then
-            xcrun xcresulttool get log --path "$r" --type console 2>/dev/null | grep -o "RELAY_LOOPBACK_LATENCY.*" | head -3 | while IFS= read -r line; do echo "::notice::$line"; done || true
-          fi
+        run: python3 Scripts/report-relay-latency.py
 
       - name: Upload compact coverage
         if: always()
