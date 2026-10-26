@@ -2551,7 +2551,8 @@ final class CloudNowUITests: XCTestCase {
     private func openSettings(in app: XCUIApplication) {
         let settings = app.buttons["Settings"]
         XCTAssertTrue(settings.waitForExistence(timeout: 8))
-        selectTab(settings, movingRight: 3)
+        // Home, Library, Store, Controller, Settings.
+        selectTab(settings, movingRight: 4)
     }
 
     @MainActor
