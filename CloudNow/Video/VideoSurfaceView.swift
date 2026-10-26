@@ -519,6 +519,14 @@ final class VideoSurfaceView: UIView {
             !overlayVisible && GCMouse.mice().isEmpty
         }
 
+        /// Hover alone (a palm on the Magic Keyboard trackpad, a Universal
+        /// Control pointer resting on the iPad) must not send mouse movement
+        /// while a controller is connected: games such as Warzone switch to
+        /// keyboard-and-mouse prompts and stop listening to the controller.
+        private var hoverDrivesGame: Bool {
+            systemPointerDrivesGame && !GCController.controllers().contains { $0.extendedGamepad != nil }
+        }
+
         func installSystemPointerSupport() {
             let hover = UIHoverGestureRecognizer(target: self, action: #selector(handlePointerHover(_:)))
             addGestureRecognizer(hover)
@@ -531,7 +539,7 @@ final class VideoSurfaceView: UIView {
         @objc private func handlePointerHover(_ recognizer: UIHoverGestureRecognizer) {
             let location = recognizer.location(in: self)
             defer { lastHoverLocation = recognizer.state == .ended ? nil : location }
-            guard systemPointerDrivesGame,
+            guard hoverDrivesGame,
                   recognizer.state == .changed,
                   let previous = lastHoverLocation
             else { return }

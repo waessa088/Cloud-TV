@@ -723,8 +723,15 @@ final nonisolated class InputSender: @unchecked Sendable {
     private var isRunning = false
     /// Slot used by a controller relayed from another Cloud TV device.
     private var relayedSlot: Int?
+    private var relayedSlotIsSony = false
     private var lastRelayedMenuPresses: UInt8?
     private var lastRelayedMenuButtons: UInt16 = 0
+    /// Last time a controller connected to this device produced input.
+    private var lastDirectActivity: UInt64 = 0
+    private var keepsVirtualControllersOnStop = false
+    /// A controller connected to the TV takes over from the relay only after
+    /// being used within this window, never merely by being connected.
+    private static let directTakeoverWindow: UInt64 = 3_000_000_000
     private var sonyGamepadEnabled = false
     private var sonySlots = Set<Int>()
     private var sonyAttachTokens: [Int: UUID] = [:]
@@ -820,7 +827,9 @@ final nonisolated class InputSender: @unchecked Sendable {
             observations.removeAll()
             for slot in sonySlots.sorted() {
                 sendGamepadSnapshot(neutralSnapshot(bitmap: gamepadBitmap), slot: slot, force: true)
-                sendSonyDeviceChange(slot: slot, connected: false)
+                if !keepsVirtualControllersOnStop {
+                    sendSonyDeviceChange(slot: slot, connected: false)
+                }
             }
             for extendedController in extendedControllers {
                 clearControllerHandlers(extendedController)
@@ -838,6 +847,8 @@ final nonisolated class InputSender: @unchecked Sendable {
             sonyAttachTokens.removeAll()
             gamepadBitmap = 0
             relayedSlot = nil
+            relayedSlotIsSony = false
+            keepsVirtualControllersOnStop = false
             lastRelayedMenuPresses = nil
             lastSnapshots.removeAll()
             lastSnapshotSend.removeAll()
@@ -850,10 +861,13 @@ final nonisolated class InputSender: @unchecked Sendable {
     /// TV handoff). It takes a free slot while fresh state arrives and gives it
     /// back, after a neutral report, as soon as the relay goes quiet.
     private func pollRelayedGamepad(now: UInt64) {
-        // A controller connected to this device directly takes over from the
-        // relay in automatic mode, so one player is never driven twice.
-        RemoteGamepadInbox.shared.setDirectControllerActive(!extendedControllers.isEmpty)
-        guard let relayed = RemoteGamepadInbox.shared.current() else {
+        let inbox = RemoteGamepadInbox.shared
+        // A controller connected to this device takes over from the relay in
+        // automatic mode once it is used, so one player is never driven twice.
+        inbox.setDirectControllerActive(
+            !extendedControllers.isEmpty && now &- lastDirectActivity < Self.directTakeoverWindow
+        )
+        guard inbox.keepsControllerPlugged() else {
             releaseRelayedSlot()
             return
         }
@@ -862,11 +876,15 @@ final nonisolated class InputSender: @unchecked Sendable {
             slot = relayedSlot
         } else {
             guard let free = firstFreeSlot else { return }
-            relayedSlot = free
-            lastRelayedMenuPresses = relayed.menuPresses
-            gamepadBitmap |= Self.extendedGamepadBitmapMask(for: free)
-            sendGamepadSnapshot(neutralSnapshot(bitmap: gamepadBitmap), slot: free, force: true)
+            plugRelayedSlot(free, sony: inbox.isSonyController)
             slot = free
+        }
+        guard let relayed = inbox.current() else {
+            // Quiet relay: keep the pad plugged in but release every input.
+            if !isPaused {
+                sendGamepadSnapshot(neutralSnapshot(bitmap: gamepadBitmap), slot: slot, now: now)
+            }
+            return
         }
         if let last = lastRelayedMenuPresses, last != relayed.menuPresses {
             notifyMenuToggle()
@@ -897,15 +915,56 @@ final nonisolated class InputSender: @unchecked Sendable {
         )
     }
 
+    /// Plugs in the relayed virtual controller as the same kind the sender
+    /// used: a DualShock when the game accepts one, otherwise an XInput pad.
+    private func plugRelayedSlot(_ slot: Int, sony: Bool) {
+        relayedSlot = slot
+        lastRelayedMenuPresses = nil
+        lastRelayedMenuButtons = 0
+        relayedSlotIsSony = sony && sonyGamepadEnabled
+        guard relayedSlotIsSony else {
+            gamepadBitmap |= Self.extendedGamepadBitmapMask(for: slot)
+            sendGamepadSnapshot(neutralSnapshot(bitmap: gamepadBitmap), slot: slot, force: true)
+            return
+        }
+        sonySlots.insert(slot)
+        sendSonyDeviceChange(slot: slot, connected: true) { [weak self] disposition in
+            guard let self else { return }
+            inputQueue.async { [weak self] in
+                guard let self, relayedSlot == slot, relayedSlotIsSony, disposition != .accepted else { return }
+                // The server refused a DualShock: fall back to an XInput pad.
+                sonySlots.remove(slot)
+                relayedSlotIsSony = false
+                gamepadBitmap |= Self.extendedGamepadBitmapMask(for: slot)
+                sendGamepadSnapshot(neutralSnapshot(bitmap: gamepadBitmap), slot: slot, force: true)
+            }
+        }
+        sendGamepadSnapshot(neutralSnapshot(bitmap: gamepadBitmap), slot: slot, force: true)
+    }
+
     private func releaseRelayedSlot() {
         guard let slot = relayedSlot else { return }
         relayedSlot = nil
         lastRelayedMenuPresses = nil
         lastRelayedMenuButtons = 0
-        gamepadBitmap &= ~Self.extendedGamepadBitmapMask(for: slot)
         sendGamepadSnapshot(neutralSnapshot(bitmap: gamepadBitmap), slot: slot, force: true)
+        if relayedSlotIsSony, sonySlots.contains(slot) {
+            sendSonyDeviceChange(slot: slot, connected: false)
+            sonySlots.remove(slot)
+        } else {
+            gamepadBitmap &= ~Self.extendedGamepadBitmapMask(for: slot)
+            sendGamepadSnapshot(neutralSnapshot(bitmap: gamepadBitmap), slot: slot, force: true)
+        }
+        relayedSlotIsSony = false
         lastSnapshots[slot] = nil
         lastSnapshotSend[slot] = nil
+    }
+
+    /// Called just before leaving a session that moves to another device: the
+    /// virtual controllers get neutral input but are not announced as
+    /// unplugged, so the game does not drop the player's controller.
+    func keepVirtualControllersOnStop() {
+        inputQueue.sync { keepsVirtualControllersOnStop = true }
     }
 
     func configure(
@@ -1207,6 +1266,11 @@ final nonisolated class InputSender: @unchecked Sendable {
         guard let slot = controllerSlots[ObjectIdentifier(controller)] else { return }
         var state = mapGCControllerToXInput(controller, deadzone: deadzone)
         lastButtons[slot] = state.buttons
+        if state.buttons != 0 || state.leftTrigger > 0 || state.rightTrigger > 0
+            || state.lx != 0 || state.ly != 0 || state.rx != 0 || state.ry != 0
+        {
+            lastDirectActivity = now
+        }
         let physicalState = state
 
         let shortcutResolution = applyKeyboardShortcutState(

@@ -149,6 +149,10 @@ final nonisolated class RemoteGamepadInbox: @unchecked Sendable {
     static let shared = RemoteGamepadInbox()
 
     static let staleAfterNanoseconds: UInt64 = 750_000_000
+    /// How long the relayed virtual controller stays plugged in without news
+    /// (Wi-Fi hiccup, iPad briefly asleep). Unplugging and replugging a pad
+    /// mid-game makes some games, Warzone included, stop listening to it.
+    static let unplugAfterNanoseconds: UInt64 = 30_000_000_000
 
     /// What `accept` tells the network layer, to build the acknowledgement.
     struct Accepted: Equatable {
@@ -160,6 +164,7 @@ final nonisolated class RemoteGamepadInbox: @unchecked Sendable {
     private let lock = NSLock()
     private var token: UInt64?
     private var mode: ControllerMode = .automatic
+    private var sonyController = false
     private var directControllerActive = false
     private var lastSequence: UInt32?
     private var state: RelayedGamepadState?
@@ -171,15 +176,39 @@ final nonisolated class RemoteGamepadInbox: @unchecked Sendable {
         self.now = now
     }
 
-    func beginSession(token: UInt64, mode: ControllerMode = .automatic, directControllerActive: Bool = false) {
+    func beginSession(
+        token: UInt64,
+        mode: ControllerMode = .automatic,
+        directControllerActive: Bool = false,
+        sonyController: Bool = false
+    ) {
         lock.lock()
         defer { lock.unlock() }
         self.token = token
         self.mode = mode
+        self.sonyController = sonyController
         self.directControllerActive = directControllerActive
         lastSequence = nil
         state = nil
-        receivedAt = 0
+        // The grace period starts now, so the virtual controller is plugged
+        // in from the first frame instead of when the first packet lands.
+        receivedAt = now()
+    }
+
+    /// True when the relayed controller is a PlayStation pad, so the TV
+    /// presents the same virtual controller type the iPad did.
+    var isSonyController: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return sonyController
+    }
+
+    /// The relayed virtual controller should stay plugged in: the relay is in
+    /// use and has been heard from within the unplug grace period.
+    func keepsControllerPlugged() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return relayInUseLocked && now() &- receivedAt <= Self.unplugAfterNanoseconds
     }
 
     func endSession() {
@@ -565,6 +594,10 @@ final nonisolated class LocalGamepadSampler: @unchecked Sendable {
 
     init(deadzone: Float = 0.15) {
         self.deadzone = deadzone
+    }
+
+    static func isSony(_ controller: GCController?) -> Bool {
+        controller?.extendedGamepad is GCDualShockGamepad || controller?.extendedGamepad is GCDualSenseGamepad
     }
 
     static func preferredController() -> GCController? {

@@ -71,6 +71,8 @@ nonisolated struct HandoffMessage: Codable {
     let release: Bool?
     /// The sender's controller mode, so the receiver applies the same routing.
     let controllerMode: String?
+    /// True when the relayed controller is a PlayStation pad.
+    let relaySony: Bool?
 
     init(
         game: GameInfo,
@@ -79,6 +81,7 @@ nonisolated struct HandoffMessage: Codable {
         relayToken: UInt64? = nil,
         release: Bool = false,
         controllerMode: ControllerMode? = nil,
+        relaySony: Bool = false,
         senderKind: HandoffDeviceKind = .current
     ) {
         version = Self.currentVersion
@@ -89,6 +92,7 @@ nonisolated struct HandoffMessage: Codable {
         self.relayToken = relayToken.map { String($0, radix: 16) }
         self.release = release ? true : nil
         self.controllerMode = controllerMode?.rawValue
+        self.relaySony = relaySony ? true : nil
     }
 
     var controllerModeValue: ControllerMode {
@@ -329,10 +333,13 @@ final class HandoffService {
             return
         }
         if let token = message.relayTokenValue {
+            // The TV's own controller only takes over once it is actually used
+            // (see InputSender), so the relay always starts in charge.
             RemoteGamepadInbox.shared.beginSession(
                 token: token,
                 mode: message.controllerModeValue,
-                directControllerActive: LocalGamepadSampler.preferredController() != nil
+                directControllerActive: false,
+                sonyController: message.relaySony == true
             )
         } else {
             RemoteGamepadInbox.shared.endSession()

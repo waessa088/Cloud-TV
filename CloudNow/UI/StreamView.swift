@@ -628,7 +628,8 @@ struct StreamView: View {
             sessionId: session.sessionId,
             appId: appId,
             relayToken: relayToken,
-            controllerMode: controllerMode
+            controllerMode: controllerMode,
+            relaySony: LocalGamepadSampler.isSony(handoff.relayableController)
         )
         Task {
             let delivered = await handoff.send(message, to: peer)
@@ -666,6 +667,7 @@ struct StreamView: View {
         releaseLocalPeerLease()
         sessionOrchestrator.detachOwnedSession()
         cancelSessionAttempt()
+        streamController.prepareForHandoff()
         streamController.disconnect()
         onDismiss()
     }

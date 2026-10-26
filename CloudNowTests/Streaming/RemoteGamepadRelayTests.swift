@@ -210,4 +210,48 @@ struct RemoteGamepadRelayTests {
         #expect(decodedRelease.isRelease)
         #expect(decodedRelease.relayTokenValue == nil)
     }
+
+    @Test("F04-E5 The relayed pad is plugged from the start and survives a short silence")
+    func relayedPadStaysPlugged() {
+        let clock = ManualClock()
+        let inbox = RemoteGamepadInbox(now: { clock.now })
+        inbox.beginSession(token: 3, mode: .automatic, sonyController: true)
+
+        // Plugged before the first packet, with no input yet.
+        #expect(inbox.keepsControllerPlugged())
+        #expect(inbox.current() == nil)
+        #expect(inbox.isSonyController)
+
+        inbox.accept(RelayedGamepadPacket.encode(sample, token: 3, sequence: 1))
+        clock.advance(by: RemoteGamepadInbox.staleAfterNanoseconds + 1)
+        // Stale: no input reaches the game, but the pad is not unplugged.
+        #expect(inbox.current() == nil)
+        #expect(inbox.keepsControllerPlugged())
+
+        clock.advance(by: RemoteGamepadInbox.unplugAfterNanoseconds)
+        #expect(!inbox.keepsControllerPlugged())
+    }
+
+    @Test("F04-E6 A suspended or ended relay unplugs the relayed pad")
+    func suspendedRelayUnplugs() {
+        let clock = ManualClock()
+        let inbox = RemoteGamepadInbox(now: { clock.now })
+        inbox.beginSession(token: 3, mode: .automatic)
+        inbox.setDirectControllerActive(true)
+        #expect(!inbox.keepsControllerPlugged())
+
+        inbox.setDirectControllerActive(false)
+        #expect(inbox.keepsControllerPlugged())
+        inbox.endSession()
+        #expect(!inbox.keepsControllerPlugged())
+    }
+
+    @Test("F04-H7 The handoff says whether the relayed controller is a PlayStation pad")
+    func handoffCarriesControllerType() throws {
+        let game = TestGameFactory.make(id: "g", title: "Game")
+        let sony = HandoffMessage(game: game, sessionId: "s", appId: nil, relayToken: 1, relaySony: true)
+        #expect(try HandoffMessage.decode(sony.encoded())?.relaySony == true)
+        let xinput = HandoffMessage(game: game, sessionId: "s", appId: nil, relayToken: 1)
+        #expect(try HandoffMessage.decode(xinput.encoded())?.relaySony == nil)
+    }
 }

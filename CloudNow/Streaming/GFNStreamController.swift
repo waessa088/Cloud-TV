@@ -621,6 +621,12 @@ final class GFNStreamController: NSObject {
     /// Invoked by VideoSurfaceView when the user presses Menu.
     /// Incrementing the counter lets SwiftUI's .onChange react without depending
     /// on the tvOS focus engine (which is suppressed when UIKit holds first responder).
+    /// The session is moving to another device: keep the game's virtual
+    /// controllers plugged in while this client lets go (see InputSender).
+    func prepareForHandoff() {
+        inputSender?.keepVirtualControllersOnStop()
+    }
+
     func handleMenuPress() {
         menuPressCount += 1
     }
