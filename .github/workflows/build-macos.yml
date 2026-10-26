@@ -43,7 +43,11 @@ jobs:
 
       - name: Show compiler errors
         if: failure()
-        run: grep -E "error:" "$RUNNER_TEMP/build.log" | sort -u | head -200
+        run: |
+          grep -E "error:" "$RUNNER_TEMP/build.log" | sort -u | head -60 | while IFS= read -r line; do
+            echo "::error::${line//$GITHUB_WORKSPACE\//}"
+          done
+          tail -40 "$RUNNER_TEMP/build.log" | while IFS= read -r line; do echo "::warning::${line}"; done
 
       - name: Ad-hoc sign and package
         run: Scripts/package-macos.sh "$RUNNER_TEMP/Nimbus-macOS.xcarchive" "$RUNNER_TEMP/Nimbus-macOS.zip"
