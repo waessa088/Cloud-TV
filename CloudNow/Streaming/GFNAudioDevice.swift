@@ -1,6 +1,6 @@
+// CoreAudio provides UnsafeMutableAudioBufferListPointer, which AVFAudio does
+// not re-export on Mac Catalyst.
 import AVFAudio
-// UnsafeMutableAudioBufferListPointer comes from the CoreAudio overlay, which
-// AVFAudio does not re-export on Mac Catalyst.
 import CoreAudio
 import Foundation
 @preconcurrency import LiveKitWebRTC
