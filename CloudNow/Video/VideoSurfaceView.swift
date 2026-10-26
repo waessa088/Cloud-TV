@@ -324,6 +324,15 @@ final class VideoSurfaceView: UIView {
         var handled = false
         for press in presses {
             #if os(iOS)
+                // ⌘⇧M toggles the stream menu from a keyboard (Mac and iPad).
+                if let key = press.key,
+                   key.modifierFlags.contains([.command, .shift]),
+                   key.charactersIgnoringModifiers.lowercased() == "m"
+                {
+                    menuPressHandler?()
+                    handled = true
+                    continue
+                }
                 // iPadOS reports a controller's B / Circle as a Menu press. The
                 // game already receives that button through GameController, and the
                 // menu opens from the PS / Home button, so swallow it here.
@@ -1081,14 +1090,32 @@ final class StreamingViewController: GCEventViewController {
             didSet {
                 guard capturesPointer != oldValue else { return }
                 pointerInteraction.invalidate()
+                setNeedsUpdateOfPrefersPointerLocked()
             }
         }
 
         private lazy var pointerInteraction = UIPointerInteraction(delegate: self)
 
+        /// On the Mac the mouse or trackpad belongs to the game while playing
+        /// (raw GCMouse deltas, cursor locked), as an FPS needs; ⌘⇧M or the
+        /// controller's PS button opens the menu, which releases it. On iPad the
+        /// pointer stays unlocked so Universal Control can leave for the Mac.
+        override var prefersPointerLocked: Bool {
+            #if targetEnvironment(macCatalyst)
+                capturesPointer
+            #else
+                false
+            #endif
+        }
+
         override func viewDidLoad() {
             super.viewDidLoad()
             videoSurface.addInteraction(pointerInteraction)
+        }
+
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            setNeedsUpdateOfPrefersPointerLocked()
         }
     #endif
 }

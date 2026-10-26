@@ -45,7 +45,7 @@ struct HandoffRelayView: View {
 
                 VStack(spacing: 12) {
                     Button(action: onResumeHere) {
-                        Label(HandoffText.resumeHere, systemImage: "ipad.landscape")
+                        Label(HandoffText.resumeHere, systemImage: HandoffDeviceKind.current.systemImage)
                             .frame(maxWidth: 360)
                     }
                     .buttonStyle(.borderedProminent)

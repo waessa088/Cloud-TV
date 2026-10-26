@@ -61,6 +61,20 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
+      - name: Archive Mac (Catalyst)
+        run: |
+          xcodebuild archive \
+            -project CloudNow.xcodeproj \
+            -scheme CloudNow \
+            -configuration Release \
+            -destination "generic/platform=macOS,variant=Mac Catalyst" \
+            -archivePath "$RUNNER_TEMP/macOS.xcarchive" \
+            -clonedSourcePackagesDirPath .spm-packages \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+          Scripts/package-macos.sh "$RUNNER_TEMP/macOS.xcarchive" "$RUNNER_TEMP/Nimbus-macOS.zip"
+
       - name: Package IPAs
         run: |
           cd "$RUNNER_TEMP"
@@ -87,4 +101,5 @@ jobs:
           files: |
             ${{ runner.temp }}/CloudTV-tvOS.ipa
             ${{ runner.temp }}/CloudTV-iPadOS.ipa
+            ${{ runner.temp }}/Nimbus-macOS.zip
           generate_release_notes: true

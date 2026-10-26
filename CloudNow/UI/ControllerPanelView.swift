@@ -41,7 +41,7 @@ struct ControllerPanelView: View {
                     connectionState
                 }
 
-                if HandoffDeviceKind.current == .iPad {
+                if HandoffDeviceKind.current.canRelayController {
                     section(ControllerText.latencySection) {
                         latencySummary
                     }

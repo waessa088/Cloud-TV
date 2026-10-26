@@ -1,0 +1,56 @@
+name: Build macOS
+
+on:
+  pull_request:
+    branches: ["**"]
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve SPM dependencies
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project CloudNow.xcodeproj \
+            -scheme CloudNow \
+            -clonedSourcePackagesDirPath .spm-packages
+
+      - name: Archive for Mac (Catalyst)
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project CloudNow.xcodeproj \
+            -scheme CloudNow \
+            -configuration Release \
+            -destination "generic/platform=macOS,variant=Mac Catalyst" \
+            -archivePath "$RUNNER_TEMP/Nimbus-macOS.xcarchive" \
+            -clonedSourcePackagesDirPath .spm-packages \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee "$RUNNER_TEMP/build.log" | grep -E "error:|\*\* ARCHIVE" || true
+          test -d "$RUNNER_TEMP/Nimbus-macOS.xcarchive/Products/Applications/CloudNow.app"
+
+      - name: Show compiler errors
+        if: failure()
+        run: grep -E "error:" "$RUNNER_TEMP/build.log" | sort -u | head -200
+
+      - name: Ad-hoc sign and package
+        run: Scripts/package-macos.sh "$RUNNER_TEMP/Nimbus-macOS.xcarchive" "$RUNNER_TEMP/Nimbus-macOS.zip"
+
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nimbus-macOS
+          path: ${{ runner.temp }}/Nimbus-macOS.zip
+          retention-days: 30

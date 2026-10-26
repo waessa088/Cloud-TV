@@ -430,6 +430,7 @@ enum PauseMenuText {
         #else
             [
                 Hint(key: "PS", label: isFrench ? "Fermer le menu" : "Close menu"),
+                Hint(key: "⌘⇧M", label: isFrench ? "Menu au clavier" : "Menu from keyboard"),
             ]
         #endif
     }

@@ -13,6 +13,8 @@ enum HandoffText {
             isFrench ? "Envoyer sur l’Apple TV" : "Send to Apple TV"
         case .iPad:
             isFrench ? "Reprendre sur l’iPad" : "Continue on iPad"
+        case .mac:
+            isFrench ? "Reprendre sur le Mac" : "Continue on Mac"
         }
     }
 
@@ -42,8 +44,8 @@ enum HandoffText {
 
     static func relayDetail(controller: String) -> String {
         isFrench
-            ? "\(controller) reste connectée à l’iPad et pilote l’Apple TV. Garde Nimbus ouvert ici."
-            : "\(controller) stays paired to this iPad and drives the Apple TV. Keep Nimbus open here."
+            ? "\(controller) reste connectée à cet appareil et pilote l’Apple TV. Garde Nimbus ouvert ici."
+            : "\(controller) stays connected to this device and drives the Apple TV. Keep Nimbus open here."
     }
 
     static var relayMenuHint: String {
@@ -53,7 +55,7 @@ enum HandoffText {
     }
 
     static var resumeHere: String {
-        isFrench ? "Reprendre sur l’iPad" : "Continue on iPad"
+        isFrench ? "Reprendre ici" : "Continue here"
     }
 
     static var stopRelay: String {
@@ -66,6 +68,8 @@ enum HandoffText {
             "Apple TV"
         case .iPad:
             "iPad"
+        case .mac:
+            "Mac"
         }
     }
 }

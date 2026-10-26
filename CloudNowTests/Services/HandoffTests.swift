@@ -132,6 +132,8 @@ struct HandoffTests {
     func deviceKind() {
         #if os(tvOS)
             #expect(HandoffDeviceKind.current == .appleTV)
+        #elseif targetEnvironment(macCatalyst)
+            #expect(HandoffDeviceKind.current == .mac)
         #else
             #expect(HandoffDeviceKind.current == .iPad)
         #endif

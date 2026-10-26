@@ -12,13 +12,29 @@ private let handoffLog = Logger(subsystem: "com.waessa.CloudTV", category: "Hand
 nonisolated enum HandoffDeviceKind: String, Codable, Sendable {
     case appleTV = "tv"
     case iPad = "ipad"
+    case mac
 
     static var current: HandoffDeviceKind {
         #if os(tvOS)
             .appleTV
+        #elseif targetEnvironment(macCatalyst)
+            .mac
         #else
             .iPad
         #endif
+    }
+
+    /// iPad and Mac keep the controller and relay it; only the TV receives.
+    var canRelayController: Bool {
+        self != .appleTV
+    }
+
+    var systemImage: String {
+        switch self {
+        case .appleTV: "appletv"
+        case .iPad: "ipad.landscape"
+        case .mac: "macbook"
+        }
     }
 }
 

@@ -534,7 +534,7 @@ struct StreamView: View {
                     id: peer.id,
                     title: HandoffText.sendTo(peer.kind),
                     subtitle: HandoffText.deviceName(peer.kind),
-                    systemImage: peer.kind == .appleTV ? "appletv" : "ipad.landscape",
+                    systemImage: peer.kind.systemImage,
                     isBusy: isHandingOff || createdSession == nil,
                     action: { handOff(to: peer) }
                 )
@@ -614,7 +614,7 @@ struct StreamView: View {
         // relay it so it never has to be re-paired. The session handoff below is
         // the same whether or not the controller is relayed.
         let controllerMode = ControllerMode.load()
-        let relayToken: UInt64? = HandoffDeviceKind.current == .iPad
+        let relayToken: UInt64? = HandoffDeviceKind.current.canRelayController
             && peer.kind == .appleTV
             && ControllerRoutingPolicy.senderRelays(
                 mode: controllerMode,
@@ -638,7 +638,7 @@ struct StreamView: View {
                 return
             }
             releaseSessionForHandoff()
-            if HandoffDeviceKind.current == .iPad, controllerMode == .bluetoothDirect {
+            if HandoffDeviceKind.current.canRelayController, peer.kind == .appleTV, controllerMode == .bluetoothDirect {
                 handoff.showsPairingHint = true
             }
             if let relayToken {
