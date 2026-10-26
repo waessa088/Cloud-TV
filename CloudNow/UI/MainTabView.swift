@@ -203,6 +203,7 @@ extension MainTabView {
             .first { $0.id == message.game.id }
         directSessionToResume = nil
         sessionToResume = session
+        HandoffService.shared.resumingFromHandoff = true
         gameToPlay = localGame ?? message.game
     }
 }

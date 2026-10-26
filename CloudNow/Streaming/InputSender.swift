@@ -960,6 +960,37 @@ final nonisolated class InputSender: @unchecked Sendable {
         lastSnapshotSend[slot] = nil
     }
 
+    /// Unplugs and replugs every virtual controller, as if the player had just
+    /// connected it. Used a moment after a handoff: games that went back to
+    /// keyboard-and-mouse while the session moved switch to the controller
+    /// again, without a trip to their settings.
+    func reannounceControllers() {
+        inputQueue.async { [weak self] in
+            guard let self, isRunning else { return }
+            let slots = Set(controllerSlots.values).union(relayedSlot.map { [$0] } ?? [])
+            guard !slots.isEmpty else { return }
+            for slot in slots.sorted() {
+                if sonySlots.contains(slot) {
+                    sendSonyDeviceChange(slot: slot, connected: false)
+                } else {
+                    gamepadBitmap &= ~Self.extendedGamepadBitmapMask(for: slot)
+                    sendGamepadSnapshot(neutralSnapshot(bitmap: gamepadBitmap), slot: slot, force: true)
+                }
+            }
+            inputQueue.asyncAfter(deadline: .now() + .milliseconds(300)) { [weak self] in
+                guard let self, isRunning else { return }
+                for slot in slots.sorted() {
+                    if sonySlots.contains(slot) {
+                        sendSonyDeviceChange(slot: slot, connected: true)
+                    } else {
+                        gamepadBitmap |= Self.extendedGamepadBitmapMask(for: slot)
+                    }
+                    sendGamepadSnapshot(neutralSnapshot(bitmap: gamepadBitmap), slot: slot, force: true)
+                }
+            }
+        }
+    }
+
     /// Called just before leaving a session that moves to another device: the
     /// virtual controllers get neutral input but are not announced as
     /// unplugged, so the game does not drop the player's controller.

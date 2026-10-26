@@ -161,6 +161,15 @@ struct StreamView: View {
         .onChange(of: streamController.state) { oldState, state in
             if state == .streaming {
                 MemoryLifecycleCoordinator.shared.streamDidStart()
+                if HandoffService.shared.resumingFromHandoff {
+                    HandoffService.shared.resumingFromHandoff = false
+                    // Let the game settle, then present the controller as newly
+                    // connected so it leaves keyboard-and-mouse mode by itself.
+                    Task {
+                        try? await Task.sleep(for: .seconds(2))
+                        streamController.reannounceControllers()
+                    }
+                }
                 // Back on the iPad after playing on the TV, the controller may
                 // still be paired to the TV: say so instead of failing silently.
                 if HandoffDeviceKind.current == .iPad, LocalGamepadSampler.preferredController() == nil {

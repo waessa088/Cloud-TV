@@ -627,6 +627,11 @@ final class GFNStreamController: NSObject {
         inputSender?.keepVirtualControllersOnStop()
     }
 
+    /// Replugs the game's virtual controllers (see InputSender).
+    func reannounceControllers() {
+        inputSender?.reannounceControllers()
+    }
+
     func handleMenuPress() {
         menuPressCount += 1
     }

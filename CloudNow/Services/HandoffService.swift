@@ -151,6 +151,9 @@ final class HandoffService {
     /// Set after a handoff in direct-Bluetooth mode: the player has to move the
     /// controller pairing by hand, so the home screen explains how.
     var showsPairingHint = false
+    /// Set when this device picks up a session from another one, so the player
+    /// re-announces the controller once the stream is up.
+    var resumingFromHandoff = false
 
     struct RelayState {
         let peer: HandoffPeer
