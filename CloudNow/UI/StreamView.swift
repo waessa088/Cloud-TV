@@ -855,7 +855,7 @@ struct StreamView: View {
             else { return }
             streamLog.error("connect: no media after timeout, resumed=\(resumed, privacy: .public)")
             guard resumed, !abandonedResumedSession else {
-                streamController.fail(with: HandoffText.connectionStalled)
+                streamController.fail(with: HandoffText.connectionStalled(stage: streamController.connectionStage))
                 return
             }
             abandonedResumedSession = true

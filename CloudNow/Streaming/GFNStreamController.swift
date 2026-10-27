@@ -434,6 +434,7 @@ final class GFNStreamController: NSObject {
         videoColorLog.info("request preference=\(settings.colorPreference.rawValue) requested=\(colorRequest.mode.rawValue) bitDepth=\(colorRequest.bitDepth) hdr=\(colorRequest.hdrRequested) codec=\(settings.codec.rawValue) decoder10Bit=\(localCapabilities.supportsHardware10BitDecode) hdrPipeline=\(localCapabilities.supportsHDRRendering) displayHDR=\(localCapabilities.displaySupportsHDR)")
         videoColorLog.info("chroma selected=\(settings.chromaFormat.rawValue, privacy: .public) requested=\(settings.effectiveChromaFormat.rawValue, privacy: .public) nvst=\(colorRequest.chromaFormat ?? 0)")
         state = .connecting
+        connectionStage = "signaling"
         serverStopped = false
         sessionInfo = session
         self.membershipTier = membershipTier
@@ -496,6 +497,7 @@ final class GFNStreamController: NSObject {
                 return
             }
             gfnLog.info("connect: signaling connected")
+            connectionStage = "offer-wait"
         } catch {
             guard connectionGeneration == generation,
                   signaling === signalingClient,
@@ -623,6 +625,9 @@ final class GFNStreamController: NSObject {
     /// on the tvOS focus engine (which is suppressed when UIKit holds first responder).
     /// The session is moving to another device: keep the game's virtual
     /// controllers plugged in while this client lets go (see InputSender).
+    /// Last connection milestone reached, shown when a connection stalls.
+    var connectionStage = ""
+
     func prepareForHandoff() {
         inputSender?.keepVirtualControllersOnStop()
     }
@@ -1058,6 +1063,7 @@ final class GFNStreamController: NSObject {
         signalingClient: GFNSignalingClient
     ) async {
         guard signaling === signalingClient, let session = sessionInfo else { return }
+        connectionStage = "offer"
         #if DEBUG
             gfnLog.debug("[Stream] Offer SDP (\(sdp.count, privacy: .public) chars):\n\(sdp, privacy: .private)")
         #endif
@@ -1290,6 +1296,7 @@ final class GFNStreamController: NSObject {
                 )
             )
             signalingComplete = true
+            connectionStage = "answer"
 
             // Inject the server's ICE host candidate AFTER sending the answer.
             // GFN offers have no a=candidate: lines — the server relies on the client to probe it.
@@ -2149,6 +2156,7 @@ extension GFNStreamController: LKRTCPeerConnectionDelegate {
         gfnLog.debug("[ICE] State → \(name, privacy: .public)")
         Task { @MainActor [weak self] in
             guard let self, peerConnection === sourcePeerConnection else { return }
+            connectionStage = "ice-\(name)"
             switch newState {
             case .connected, .completed:
                 wasStreaming = true

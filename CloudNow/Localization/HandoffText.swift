@@ -62,10 +62,11 @@ enum HandoffText {
         isFrench ? "Arrêter le relais de la manette" : "Stop relaying the controller"
     }
 
-    static var connectionStalled: String {
-        isFrench
+    static func connectionStalled(stage: String) -> String {
+        let text = isFrench
             ? "Le serveur ne répond pas. Réessaie : une nouvelle partie sera lancée."
             : "The server is not responding. Retry to start a new session."
+        return stage.isEmpty ? text : "\(text) (\(stage))"
     }
 
     static func deviceName(_ kind: HandoffDeviceKind) -> String {
