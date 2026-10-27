@@ -62,6 +62,12 @@ enum HandoffText {
         isFrench ? "Arrêter le relais de la manette" : "Stop relaying the controller"
     }
 
+    static var connectionStalled: String {
+        isFrench
+            ? "Le serveur ne répond pas. Réessaie : une nouvelle partie sera lancée."
+            : "The server is not responding. Retry to start a new session."
+    }
+
     static func deviceName(_ kind: HandoffDeviceKind) -> String {
         switch kind {
         case .appleTV:

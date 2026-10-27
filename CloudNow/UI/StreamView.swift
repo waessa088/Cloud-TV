@@ -72,6 +72,11 @@ struct StreamView: View {
     @State private var handoffError: String?
     @State private var showControllerPanel = false
     @State private var showMissingControllerHint = false
+    /// Fails or restarts an attempt whose media never arrives (see
+    /// armConnectionWatchdog), so the player never waits forever.
+    @State private var connectionWatchdog: Task<Void, Never>?
+    /// Set once a resumed session stalled: later attempts create a new one.
+    @State private var abandonedResumedSession = false
     /// Per-ad state tracking to avoid duplicate reports
     @State private var adReportedAction: [String: AdAction] = [:]
 
@@ -153,6 +158,7 @@ struct StreamView: View {
             await startSession(generation: generation)
         }
         .onDisappear {
+            connectionWatchdog?.cancel()
             cancelSessionAttempt()
             streamController.disconnect()
             releaseLocalPeerLease()
@@ -667,6 +673,8 @@ struct StreamView: View {
         releaseLocalPeerLease()
         sessionOrchestrator.detachOwnedSession()
         cancelSessionAttempt()
+        // The other device owns the session now: never try to resume it here.
+        viewModel.clearLastSession()
         streamController.prepareForHandoff()
         streamController.disconnect()
         onDismiss()
@@ -829,6 +837,40 @@ struct StreamView: View {
 
     // MARK: Actions
 
+    /// Media normally arrives within seconds of the signaling connection.
+    private static let connectionTimeout: Duration = .seconds(25)
+
+    /// A session can be ready on NVIDIA's side yet never deliver media, typically
+    /// an old session resumed after a handoff or held by another device. Without
+    /// this the player would sit on "Connecting to your session…" forever: a
+    /// stalled resume is dropped and replaced by a new session once; a stalled
+    /// new session fails with a retry button.
+    private func armConnectionWatchdog(generation: UInt64, resumed: Bool) {
+        connectionWatchdog?.cancel()
+        connectionWatchdog = Task { @MainActor in
+            try? await Task.sleep(for: Self.connectionTimeout)
+            guard !Task.isCancelled,
+                  isCurrentSessionAttempt(generation),
+                  streamController.state == .connecting
+            else { return }
+            streamLog.error("connect: no media after timeout, resumed=\(resumed, privacy: .public)")
+            guard resumed, !abandonedResumedSession else {
+                streamController.fail(with: HandoffText.connectionStalled)
+                return
+            }
+            abandonedResumedSession = true
+            streamController.disconnect()
+            guard await stopOwnedSessionAndReleaseLease() else {
+                streamController.fail(with: L10n.text("previous_session_still_active"))
+                return
+            }
+            createdSession = nil
+            viewModel.clearLastSession()
+            viewModel.resumableSession = nil
+            retrySessionAttempt()
+        }
+    }
+
     private func retrySessionAttempt() {
         sessionOrchestrator.cancelAttempt()
         sessionAttemptState.retry()
@@ -865,8 +907,10 @@ struct StreamView: View {
 
         // A previous player can dismiss while its server allocation is ending.
         // Join that cleanup before resuming or creating another allocation.
-        var directSession = directSession
-        var existingSession = existingSession
+        // After a stalled resume, neither the offered nor the saved session is
+        // trusted again: the next attempt starts a fresh one.
+        var directSession = abandonedResumedSession ? nil : directSession
+        var existingSession = abandonedResumedSession ? nil : existingSession
         if let pending = cloudSessionCoordinator.sessionPendingEnd,
            pending.provider == .geForceNow
         {
@@ -956,6 +1000,7 @@ struct StreamView: View {
                     sessionStartedAt: persistedSessionStart(for: sessionInfo),
                     supportedControls: streamSupportedControls
                 )
+                armConnectionWatchdog(generation: generation, resumed: true)
                 return
             } catch is CancellationError {
                 return
@@ -1156,6 +1201,7 @@ struct StreamView: View {
                 sessionStartedAt: persistedSessionStart(for: sessionInfo),
                 supportedControls: supportedControls(for: connectedAppId)
             )
+            armConnectionWatchdog(generation: generation, resumed: isContinuingExistingSession)
         } catch is CancellationError {
             return
         } catch SessionOrchestrationError.sessionEnded {
